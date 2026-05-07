@@ -1,5 +1,7 @@
 # AI Pingora Gateway Generator
 
+![Tests](https://github.com/officialsandyk-lang/pingora-generator/actions/workflows/tests.yml/badge.svg)
+
 An experimental AI-powered Pingora application gateway and load balancer generator.
 
 This project turns natural-language infrastructure instructions into a working Rust/Pingora reverse proxy with route generation, blue/green deployment, live updates, security policy enforcement, runtime repair, deployment repair, and optional LangSmith tracing.
