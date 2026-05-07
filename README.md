@@ -758,7 +758,9 @@ License not selected yet.
 Before public release, add a license file such as:
 
 ```text
-LICENSE
+
+
+Apache License 2.0.
 ```
 
 For private/internal use, this can remain undecided.
