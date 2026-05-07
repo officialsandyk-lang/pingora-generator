@@ -1,0 +1,34 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Rust
+target/
+**/target/
+
+# Generated projects/runtime artifacts
+generated-pingora-proxy/target/
+generated-projects/
+backups/
+*.jsonl
+
+# Runtime state/config
+active_config.json
+gateway_config.json
+bluegreen_state.json
+gateway_state.json
+.gateway_state.json
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+*.save
+generated-pingora-proxy/
