@@ -13,6 +13,7 @@ jobs:
     env:
       ENABLE_LANGCHAIN_UPDATE_AGENT: "false"
       LANGSMITH_TRACING: "false"
+      RUN_LANGSMITH_SMOKE_TEST: "0"
 
     steps:
       - name: Check out repository
@@ -34,4 +35,4 @@ jobs:
           fi
 
       - name: Run tests
-        run: pytest -q
+        run: pytest -q tests
