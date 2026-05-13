@@ -1,12 +1,10 @@
 # AI Pingora Gateway Generator
 
-![Tests](https://github.com/officialsandyk-lang/pingora-generator/actions/workflows/tests.yml/badge.svg)
-
 An experimental AI-powered Pingora application gateway and load balancer generator.
 
-This project turns natural-language infrastructure instructions into a working Rust/Pingora reverse proxy with route generation, blue/green deployment, live updates, security policy enforcement, runtime repair, deployment repair, and optional LangSmith tracing.
+This project turns natural-language infrastructure instructions into a working Rust/Pingora reverse proxy with route generation, live updates, blue/green deployment experiments, security policy enforcement, runtime repair, deployment repair, and optional LangSmith tracing.
 
-> Status: Developer preview. Generated infrastructure should be reviewed before production use.
+> **Status:** Developer preview. Generated infrastructure should be reviewed before any production use.
 
 ---
 
@@ -18,15 +16,31 @@ AI Pingora Gateway Generator lets you describe a gateway in natural language:
 python main.py "create proxy on port 8088 with / to backend 3000, /users to backend 3000, /orders to backend 5000, /billing to backend 6000, /reports to backend 7000, and /admin to backend 8000. Block /private and /internal, only allow GET and POST, set rate limit to 120 requests per minute, max request body to 1048576 bytes, max connections to 1000, and upstream timeout to 30 seconds"
 ```
 
-The system generates a Pingora-based application gateway, validates it, builds it, and deploys it with blue/green switching.
+The system generates a Pingora-based application gateway, validates the generated config, writes a Rust/Pingora project, runs checks, and can deploy through the project’s blue/green deployment workflow.
 
-The current product positioning is:
+Current product positioning:
 
 > AI-powered Pingora application gateway and load balancer generator.
 
-The long-term direction is:
+Long-term direction:
 
 > AI-powered ADN / application delivery platform.
+
+---
+
+## Developer-preview notice
+
+This project is an early developer-preview infrastructure generator.
+
+It is intended for:
+
+- experimentation
+- learning
+- local testing
+- early gateway automation research
+- prototype control-plane workflows
+
+It is **not** production-ready infrastructure yet. Do not use it for critical production traffic without additional hardening, security review, operational testing, rollback validation, observability, and deployment testing.
 
 ---
 
@@ -35,14 +49,15 @@ The long-term direction is:
 - Natural-language gateway creation
 - Natural-language live updates
 - Pingora Rust project generation
-- Route-based reverse proxy/load balancing
+- Route-based reverse proxy / load-balancer style configuration
 - Demo backend HTML page generation
 - Clickable route index at `/`
-- Stable public edge URL
-- Blue/green deployment
+- Stable local edge URL, usually `http://127.0.0.1:8088`
+- Blue/green deployment workflow experiments
 - Active/inactive color switching
 - Config repair
 - Runtime repair for generated Pingora/Rust issues
+- Deployment repair classification
 - Security policy extraction
 - Blocked path enforcement
 - Allowed method enforcement
@@ -52,13 +67,13 @@ The long-term direction is:
 - Upstream timeout configuration
 - Safe destructive update handling
 - Duplicate/no-op update summaries
-- LangSmith tracing for agent and LLM visibility
+- Optional LangSmith tracing for agent and LLM visibility
 
 ---
 
 ## Architecture
 
-The project uses a small multi-agent control plane to generate, repair, validate, and deploy a Pingora gateway.
+The project uses a small AI-assisted control plane to generate, repair, validate, and deploy a Pingora gateway.
 
 ```text
 User prompt
@@ -69,13 +84,13 @@ main.py / update.py
    v
 orchestration graph
    |
-   +--> config update / prompt-to-config agent
+   +--> prompt-to-config / config update agent
    +--> config repair agent
    +--> security agent
    +--> project writer
-   +--> runtime agent
+   +--> runtime/debug agent
    +--> deployment repair agent
-   +--> blue/green deploy
+   +--> blue/green deploy workflow
    |
    v
 generated Pingora gateway
@@ -84,6 +99,8 @@ generated Pingora gateway
 http://127.0.0.1:8088
 ```
 
+The AI layer helps interpret and repair intent, but generated configuration and infrastructure should always be reviewed before use.
+
 ---
 
 ## Project structure
@@ -91,7 +108,6 @@ http://127.0.0.1:8088
 ```text
 pingora-generator/
 ├── agents/
-│   ├── __init__.py
 │   ├── config_repair_agent.py
 │   ├── config_update_agent.py
 │   ├── control_plane_repair_agent.py
@@ -101,13 +117,23 @@ pingora-generator/
 │   ├── runtime_agent.py
 │   └── security_agent.py
 ├── ai/
+│   └── ai_config.py
 ├── core/
+│   ├── bluegreen_deployer.py
+│   ├── compose_writer.py
+│   ├── docker_writer.py
+│   ├── logger.py
+│   ├── preflight.py
 │   ├── project_writer.py
-│   └── safety.py
+│   ├── runner.py
+│   ├── safety.py
+│   └── validator.py
 ├── orchestration/
 │   ├── graph.py
+│   ├── state.py
 │   └── update_graph.py
 ├── scripts/
+├── tests/
 ├── main.py
 ├── update.py
 ├── rollback.py
@@ -115,6 +141,7 @@ pingora-generator/
 ├── test_langsmith_client.py
 ├── .env.example
 ├── .gitignore
+├── LICENSE
 └── README.md
 ```
 
@@ -147,7 +174,7 @@ only allow GET and POST
 set rate limit to 90 requests per minute
 ```
 
-It also detects no-op and duplicate updates.
+It also detects duplicate and no-op updates.
 
 Example summary:
 
@@ -158,7 +185,7 @@ Route already absent: /admin
 
 ### `config_repair_agent.py`
 
-Repairs invalid or incomplete gateway configs before project generation.
+Repairs invalid or incomplete gateway configs before validation and project generation.
 
 ### `security_agent.py`
 
@@ -186,7 +213,7 @@ update.py expected run_update_flow
 update_graph.py actually has run_update_graph
 ```
 
-Instead of crashing, it introspects the update graph and selects the valid entrypoint.
+Instead of crashing, it can introspect the update graph and select the valid entrypoint.
 
 ### `deployment_repair_agent.py`
 
@@ -198,7 +225,7 @@ Example:
 failed to resolve source metadata for docker.io/library/rust:1-bookworm
 ```
 
-The deployment repair agent can classify this as an infrastructure/network issue rather than a prompt/config issue.
+The deployment repair agent is intended to classify this as an infrastructure/network issue rather than a prompt/config issue.
 
 ### `debug_agent.py`
 
@@ -206,7 +233,7 @@ Helps inspect and explain failures during generation or deployment.
 
 ### `reliability_agent.py`
 
-Traces reliability-related checks and future policy logic.
+Contains early reliability-related tracing/check logic for future policy and MTTR workflows.
 
 ---
 
@@ -232,7 +259,7 @@ source .venv/bin/activate
 
 Install required Python packages.
 
-If your project has `requirements.txt`:
+If the project has `requirements.txt`:
 
 ```bash
 pip install -r requirements.txt
@@ -258,7 +285,7 @@ Do not commit `.env`.
 
 ## Environment variables
 
-Create `.env.example` with placeholder values like this:
+Example `.env.example` values:
 
 ```env
 OPENAI_API_KEY=your-openai-api-key-here
@@ -285,7 +312,7 @@ Never commit real API keys.
 
 ## LangSmith notes
 
-This project supports LangSmith tracing.
+This project supports optional LangSmith tracing.
 
 For the default US LangSmith region:
 
@@ -332,6 +359,8 @@ control_plane_repair_agent
 deployment_repair_agent
 ```
 
+LangSmith is optional observability for the AI/control-plane layer. The generated gateway should not depend on LangSmith at runtime.
+
 ---
 
 ## Create a gateway
@@ -347,11 +376,10 @@ Expected output includes:
 ```text
 Project generated successfully
 cargo check passed
-Update deployed with blue/green switching
 Live URL: http://127.0.0.1:8088
 ```
 
-The stable local gateway URL is:
+The stable local gateway URL is usually:
 
 ```text
 http://127.0.0.1:8088
@@ -418,10 +446,43 @@ Added route: /inventory -> 127.0.0.1:9001
 Added route: /payments -> 127.0.0.1:9100
 Added route: /support -> 127.0.0.1:9200
 Removed route: /admin
-Security changed: blocked paths updated, allowed methods updated
+Security changed
 ```
 
-The update flow uses the active blue/green config as the source of truth.
+The update flow uses the active blue/green config as the source of truth where available.
+
+---
+
+## Local mode vs Docker blue/green mode
+
+There are two important runtime modes.
+
+### Local mode
+
+In local mode, the Pingora gateway process itself listens on the public port, for example:
+
+```text
+127.0.0.1:8088
+```
+
+If a local gateway is already running, update commands may require stopping and restarting the local process because the port is already in use.
+
+Useful check:
+
+```bash
+ss -ltnp | grep :8088
+```
+
+### Docker blue/green mode
+
+In Docker blue/green mode, the public URL is intended to stay stable while the inactive color is built, checked, and switched after validation.
+
+Rule of thumb:
+
+```text
+Local mode = restart may be required
+Docker blue/green mode = intended zero-downtime update path
+```
 
 ---
 
@@ -441,7 +502,7 @@ Expected if the route already exists:
 Duplicate route ignored: /inventory already exists -> 127.0.0.1:9001
 ```
 
-For no-op updates, the system should skip project generation, cargo check, Docker build, and blue/green switching.
+For no-op updates, the system should skip unnecessary generation/build/deployment work.
 
 ---
 
@@ -518,7 +579,7 @@ The gateway keeps a stable public edge URL:
 http://127.0.0.1:8088
 ```
 
-Updates are deployed through active/inactive color switching.
+Updates are deployed through active/inactive color switching where the Docker blue/green flow is used.
 
 Example output:
 
@@ -550,7 +611,7 @@ Manual retry:
 docker pull rust:1-bookworm
 ```
 
-Then rerun the update command.
+Then rerun the create or update command.
 
 The deployment repair agent is intended to classify these failures and avoid misleading prompt/config suggestions.
 
@@ -564,6 +625,12 @@ Compile-check Python files:
 python -m py_compile update.py
 python -m py_compile orchestration/update_graph.py
 python -m py_compile agents/config_update_agent.py
+```
+
+Run tests:
+
+```bash
+pytest -q
 ```
 
 Run LangSmith auth test:
@@ -667,6 +734,7 @@ Safe files to commit:
 README.md
 .env.example
 .gitignore
+LICENSE
 main.py
 update.py
 rollback.py
@@ -675,6 +743,7 @@ ai/
 core/
 orchestration/
 scripts/
+tests/
 test_langsmith.py
 test_langsmith_client.py
 ```
@@ -695,32 +764,24 @@ reports/
 
 ---
 
-## Publishing recommendation
+## Publishing status
 
-For early development, keep the repository private.
+This repository is public as a developer-preview project.
 
-Recommended flow:
-
-```text
-Private repo first
-Clean secrets and docs
-Add tests
-Review generated code
-Publish limited developer preview later
-```
-
-If making public later, treat it as an experimental developer preview, not production-ready infrastructure.
+It is shared for experimentation, learning, and early feedback. It should not be treated as production-ready infrastructure yet.
 
 ---
 
 ## Known limitations
 
 - This is not production-ready infrastructure.
-- Generated code should be reviewed before use.
+- Generated code and configs should be reviewed before use.
+- Local mode updates may require restarting the local gateway process.
+- Docker blue/green mode is the intended path for zero-downtime update experiments.
 - Docker builds may fail because of transient Docker Hub/network issues.
 - LangSmith keys must match the correct LangSmith region.
 - Current demo backends are for local testing only.
-- Advanced health checks, retries, circuit breakers, weighted routing, WAF rules, and full ADN features are future work.
+- Advanced active health checks, retries, circuit breakers, weighted routing, WAF rules, and full ADN features are future work.
 - The AI update flow should be reviewed before applying to critical systems.
 
 ---
@@ -734,7 +795,7 @@ Planned direction:
 - Circuit breakers
 - Weighted routing
 - Canary deployment
-- Rollback command
+- Rollback command hardening
 - Policy diff preview
 - Config validation report
 - Better deployment repair
@@ -755,14 +816,6 @@ Always review generated configs and code before using them in production environ
 
 ## License
 
-License not selected yet.
+This project is licensed under the Apache License 2.0.
 
-Before public release, add a license file such as:
-
-```text
-
-
-Apache License 2.0.
-```
-
-For private/internal use, this can remain undecided.
+See [LICENSE](./LICENSE) for details.
