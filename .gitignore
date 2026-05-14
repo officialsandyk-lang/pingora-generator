@@ -32,3 +32,15 @@ gateway_state.json
 .idea/
 *.save
 generated-pingora-proxy/
+
+# Local runtime/generated state
+.runtime/
+tmp/
+runtime/
+data/
+*.pid
+*.log
+logs.jsonl
+bluegreen_failure_evidence.txt
+bluegreen_deployer_failure_evidence.txt
+bluegreen_deployer_entered.txt

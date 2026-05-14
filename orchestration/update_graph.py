@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import json
-import os
 import shutil
 import subprocess
 from copy import deepcopy
@@ -22,6 +20,16 @@ except Exception:
         return decorator
 
 from agents.config_update_agent import apply_config_update
+from core.reliability import ReliabilityBrain
+
+try:
+    from core.preflight import ConfigPreflightError, PreflightError
+except Exception:
+    class PreflightError(RuntimeError):
+        pass
+
+    class ConfigPreflightError(PreflightError):
+        pass
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +53,7 @@ def _get_callable(module_name: str, names: list[str]) -> Callable[..., Any] | No
 
     for name in names:
         fn = getattr(module, name, None)
+
         if callable(fn):
             return fn
 
@@ -52,10 +61,6 @@ def _get_callable(module_name: str, names: list[str]) -> Callable[..., Any] | No
 
 
 def _call_flex(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """
-    Calls project functions even if your local function signature differs slightly.
-    """
-
     attempts = [
         lambda: fn(*args, **kwargs),
         lambda: fn(*args),
@@ -81,14 +86,17 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
     except Exception:
         return None
+
+    return data if isinstance(data, dict) else None
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _normalize_summary(summary: Any) -> list[str]:
@@ -96,12 +104,14 @@ def _normalize_summary(summary: Any) -> list[str]:
         return []
 
     if isinstance(summary, str):
-        return [summary]
+        text = summary.strip()
+        return [text] if text else []
 
     if isinstance(summary, list):
         return [str(item).strip() for item in summary if str(item).strip()]
 
-    return [str(summary)]
+    text = str(summary).strip()
+    return [text] if text else []
 
 
 def _dedupe_summary(summary: list[str]) -> list[str]:
@@ -121,8 +131,56 @@ def _dedupe_summary(summary: list[str]) -> list[str]:
     return output
 
 
+def _stage_for_exception(stage: str, exc: BaseException) -> str:
+    text = str(exc).lower()
+
+    if isinstance(exc, ConfigPreflightError):
+        return "config_preflight"
+
+    if isinstance(exc, PreflightError):
+        return "environment_preflight"
+
+    if stage:
+        return stage
+
+    if "config-level preflight" in text or "proxy/backend port conflict" in text:
+        return "config_preflight"
+
+    if "preflight checks failed" in text:
+        return "environment_preflight"
+
+    if "cargo check" in text or "could not compile" in text:
+        return "cargo_check"
+
+    if "docker" in text or "compose" in text or "registry" in text:
+        return "bluegreen_deploy"
+
+    if "health check" in text or "readiness" in text:
+        return "bluegreen_deploy"
+
+    if "httppeer" in text or "host:port" in text:
+        return "runtime"
+
+    return "unknown"
+
+
 def _discover_active_color() -> str:
+    get_active_color = _get_callable(
+        "core.deployment_state",
+        ["get_active_color"],
+    )
+
+    if get_active_color is not None:
+        try:
+            color = _call_flex(get_active_color)
+
+            if isinstance(color, str) and color.lower() in {"blue", "green"}:
+                return color.lower()
+        except Exception:
+            pass
+
     state_files = [
+        DEFAULT_BLUEGREEN_ROOT / "deployment_state.json",
         PROJECT_ROOT / "bluegreen_state.json",
         PROJECT_ROOT / "gateway_state.json",
         PROJECT_ROOT / ".gateway_state.json",
@@ -139,12 +197,15 @@ def _discover_active_color() -> str:
 
         for key in ("active_color", "active", "color", "current_color"):
             value = state.get(key)
+
             if isinstance(value, str) and value.lower() in {"blue", "green"}:
                 return value.lower()
 
     active_color_file = DEFAULT_BLUEGREEN_ROOT / "active_color.txt"
+
     if active_color_file.exists():
         value = active_color_file.read_text(encoding="utf-8").strip().lower()
+
         if value in {"blue", "green"}:
             return value
 
@@ -157,45 +218,44 @@ def _inactive_color(active_color: str) -> str:
 
 def _config_candidates(active_color: str) -> list[Path]:
     return [
+        DEFAULT_BLUEGREEN_ROOT / "current_config.json",
         PROJECT_ROOT / "active_config.json",
         PROJECT_ROOT / "gateway_config.json",
         PROJECT_ROOT / "config.json",
-        GENERATED_PROJECT_DIR / "gateway_config.json",
         GENERATED_PROJECT_DIR / "config.json",
+        GENERATED_PROJECT_DIR / "gateway_config.json",
         DEFAULT_BLUEGREEN_ROOT / "active_config.json",
         DEFAULT_BLUEGREEN_ROOT / active_color / "active_config.json",
         DEFAULT_BLUEGREEN_ROOT / active_color / "gateway_config.json",
         DEFAULT_BLUEGREEN_ROOT / active_color / "config.json",
-        DEFAULT_BLUEGREEN_ROOT / active_color / "generated-pingora-proxy" / "gateway_config.json",
-        DEFAULT_BLUEGREEN_ROOT / active_color / "generated-pingora-proxy" / "config.json",
+        DEFAULT_BLUEGREEN_ROOT
+        / active_color
+        / "generated-pingora-proxy"
+        / "config.json",
+        DEFAULT_BLUEGREEN_ROOT
+        / active_color
+        / "generated-pingora-proxy"
+        / "gateway_config.json",
     ]
 
 
 @traceable(name="load_active_config", run_type="chain")
 def load_active_config() -> tuple[dict[str, Any], str]:
-    """
-    Uses your existing active-config loader if available.
-    Falls back to known config file locations.
-    """
-
     active_color = _discover_active_color()
 
     loader = _get_callable(
-        "core.bluegreen_deploy",
+        "core.project_store",
         [
-            "load_active_config",
-            "get_active_config",
-            "read_active_config",
+            "load_current_config",
+            "load_project_config",
+            "get_current_config",
+            "read_current_config",
         ],
     )
 
     if loader is not None:
         try:
-            result = _call_flex(loader, project_root=PROJECT_ROOT)
-
-            if isinstance(result, tuple) and result and isinstance(result[0], dict):
-                loaded_color = result[1] if len(result) > 1 and isinstance(result[1], str) else active_color
-                return result[0], loaded_color
+            result = _call_flex(loader)
 
             if isinstance(result, dict):
                 return result, active_color
@@ -204,13 +264,15 @@ def load_active_config() -> tuple[dict[str, Any], str]:
 
     for path in _config_candidates(active_color):
         config = _read_json(path)
+
         if config is not None:
             return config, active_color
 
     raise FileNotFoundError(
         "Could not find active gateway config. "
-        "Expected one of active_config.json, gateway_config.json, config.json, "
-        "or a blue/green generated config."
+        "Expected generated-projects/default-project/current_config.json, "
+        "generated-pingora-proxy/config.json, active_config.json, "
+        "gateway_config.json, or a blue/green generated config."
     )
 
 
@@ -219,10 +281,10 @@ def update_prompt_to_config(
     active_config: dict[str, Any],
     prompt: str,
 ) -> dict[str, Any]:
-    return apply_config_update(active_config, prompt)
+    return apply_config_update(deepcopy(active_config), prompt)
 
 
-@traceable(name="security", run_type="chain")
+@traceable(name="update_security", run_type="chain")
 def run_security(updated_config: dict[str, Any], prompt: str) -> dict[str, Any]:
     security_fn = _get_callable(
         "agents.security_agent",
@@ -244,20 +306,18 @@ def run_security(updated_config: dict[str, Any], prompt: str) -> dict[str, Any]:
         except TypeError:
             secured = security_fn(updated_config)
 
-    if isinstance(secured, dict):
-        print("✅ Security check passed")
-        return secured
-
     print("✅ Security check passed")
-    return updated_config
+
+    return secured if isinstance(secured, dict) else updated_config
 
 
-@traceable(name="config_preflight", run_type="chain")
+@traceable(name="update_config_preflight", run_type="tool")
 def run_config_preflight(config: dict[str, Any]) -> None:
     preflight_fn = (
         _get_callable(
-            "agents.config_repair_agent",
+            "core.preflight",
             [
+                "preflight_check_config",
                 "run_config_preflight",
                 "config_preflight",
                 "preflight_config",
@@ -273,45 +333,62 @@ def run_config_preflight(config: dict[str, Any]) -> None:
                 "validate_config_preflight",
             ],
         )
+        or _get_callable(
+            "agents.config_repair_agent",
+            [
+                "run_config_preflight",
+                "config_preflight",
+                "preflight_config",
+                "validate_config_preflight",
+            ],
+        )
     )
 
     if preflight_fn is None:
+        print("ℹ️ No config preflight function found; skipping config preflight.")
         return
 
-    print("🧪 Running config-level preflight checks...")
-    _call_flex(preflight_fn, config)
+    print("Running config-level preflight checks...")
+
+    try:
+        preflight_fn(
+            config,
+            use_docker=False,
+            use_compose=True,
+            check_listen_port_available=False,
+        )
+    except TypeError:
+        # Backward-compatible fallback for older preflight functions.
+        try:
+            preflight_fn(
+                config,
+                use_docker=False,
+                use_compose=True,
+            )
+        except TypeError:
+            _call_flex(preflight_fn, config)
+
     print("✅ Config-level preflight checks passed")
 
 
-def _project_writer_candidates() -> list[tuple[str, list[str]]]:
-    return [
-        (
-            "core.project_writer",
-            [
-                "write_project",
-                "generate_project",
-                "write_pingora_project",
-                "generate_pingora_project",
-                "create_project",
-                "write",
-            ],
-        ),
-    ]
-
-
-@traceable(name="project_writer", run_type="chain")
+@traceable(name="update_project_writer", run_type="tool")
 def run_project_writer(config: dict[str, Any]) -> Path:
-    writer_fn: Callable[..., Any] | None = None
-
-    for module_name, names in _project_writer_candidates():
-        writer_fn = _get_callable(module_name, names)
-        if writer_fn is not None:
-            break
+    writer_fn = _get_callable(
+        "core.project_writer",
+        [
+            "write_project",
+            "generate_project",
+            "write_pingora_project",
+            "generate_pingora_project",
+            "create_project",
+            "write",
+        ],
+    )
 
     if writer_fn is None:
         raise RuntimeError(
-            "Could not find project writer. Expected a function in core.project_writer "
-            "such as write_project, generate_project, or write_pingora_project."
+            "Could not find project writer. "
+            "Expected core.project_writer.write_project or equivalent."
         )
 
     call_attempts = [
@@ -328,8 +405,10 @@ def run_project_writer(config: dict[str, Any]) -> Path:
     for attempt in call_attempts:
         try:
             result = attempt()
+
             if isinstance(result, (str, Path)):
                 return Path(result)
+
             return GENERATED_PROJECT_DIR
         except TypeError as exc:
             last_error = exc
@@ -338,31 +417,80 @@ def run_project_writer(config: dict[str, Any]) -> Path:
     raise last_error or RuntimeError("Project writer failed.")
 
 
-@traceable(name="cargo_check", run_type="tool")
-def run_cargo_check(project_dir: Path) -> None:
+@traceable(name="update_container_files", run_type="tool")
+def run_container_files(config: dict[str, Any]) -> None:
+    compose_fn = _get_callable(
+        "core.compose_writer",
+        ["write_compose_files", "write_compose", "generate_compose_files"],
+    )
+
+    docker_fn = _get_callable(
+        "core.docker_writer",
+        ["write_docker_files", "write_dockerfile", "generate_docker_files"],
+    )
+
+    if compose_fn is not None:
+        _call_flex(compose_fn, config)
+        print("✅ Compose files generated")
+        return
+
+    if docker_fn is not None:
+        _call_flex(docker_fn, config)
+        print("✅ Docker files generated")
+        return
+
+    print("ℹ️ No container file writer found; continuing.")
+
+
+@traceable(name="update_cargo_check", run_type="tool")
+def run_cargo_check(
+    prompt: str,
+    config: dict[str, Any],
+    project_dir: Path,
+) -> None:
     cargo_fn = _get_callable(
-        "agents.runtime_agent",
+        "core.runner",
         [
-            "run_cargo_check",
             "cargo_check",
-            "repair_and_check",
-            "runtime_check",
         ],
     )
 
     if cargo_fn is not None:
-        result = _call_flex(cargo_fn, project_dir)
+        result = None
 
-        if isinstance(result, dict) and result.get("success") is False:
-            raise RuntimeError(result.get("error") or "cargo check failed")
+        call_attempts = [
+            lambda: cargo_fn(prompt, config, project_dir=project_dir),
+            lambda: cargo_fn(prompt=prompt, config=config, project_dir=project_dir),
+            lambda: cargo_fn(prompt, config),
+            lambda: cargo_fn(config=config),
+            lambda: cargo_fn(project_dir),
+        ]
+
+        last_error: Exception | None = None
+
+        for attempt in call_attempts:
+            try:
+                result = attempt()
+                break
+            except TypeError as exc:
+                last_error = exc
+                continue
+
+        if result is False:
+            raise RuntimeError("Cargo check failed after debug attempts.")
+
+        if result is None and last_error is not None:
+            raise last_error
 
         return
 
     cargo_toml = project_dir / "Cargo.toml"
+
     if not cargo_toml.exists():
+        print(f"ℹ️ Cargo.toml not found at {cargo_toml}; skipping cargo check.")
         return
 
-    print("🔍 Running cargo check... attempt 1/3")
+    print("Running cargo check...")
 
     result = subprocess.run(
         ["cargo", "check"],
@@ -389,41 +517,76 @@ def _copy_project_to_color(project_dir: Path, target_color: str) -> Path:
         shutil.rmtree(target_project)
 
     target_project.parent.mkdir(parents=True, exist_ok=True)
+
     shutil.copytree(
         project_dir,
         target_project,
-        ignore=shutil.ignore_patterns("target", ".git", "__pycache__", ".pytest_cache"),
+        ignore=shutil.ignore_patterns(
+            "target",
+            ".git",
+            "__pycache__",
+            ".pytest_cache",
+        ),
     )
 
     return target_project
 
 
-@traceable(name="bluegreen_deploy", run_type="chain")
+@traceable(name="update_bluegreen_deploy", run_type="chain")
 def run_bluegreen_deploy(
     config: dict[str, Any],
     project_dir: Path,
     active_color: str,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    deploy_fn = _get_callable(
-        "core.bluegreen_deploy",
-        [
-            "deploy_bluegreen",
-            "bluegreen_deploy",
-            "deploy",
-            "run_bluegreen_deploy",
-            "switch_bluegreen",
-        ],
+    reliability = ReliabilityBrain()
+    target_color = _inactive_color(active_color)
+
+    reliability.record_deployment_event(
+        run_id=run_id,
+        event_type="update_bluegreen_deploy",
+        status="started",
+        color=target_color,
+        details={
+            "previous_active_color": active_color,
+            "port": config.get("port"),
+            "route_count": len(config.get("routes", [])),
+        },
     )
 
-    target_color = _inactive_color(active_color)
+    deploy_fn = (
+        _get_callable(
+            "core.bluegreen_deployer",
+            [
+                "deploy_config_bluegreen",
+                "deploy_bluegreen",
+                "bluegreen_deploy",
+                "deploy",
+                "run_bluegreen_deploy",
+                "switch_bluegreen",
+            ],
+        )
+        or _get_callable(
+            "core.bluegreen_deploy",
+            [
+                "deploy_config_bluegreen",
+                "deploy_bluegreen",
+                "bluegreen_deploy",
+                "deploy",
+                "run_bluegreen_deploy",
+                "switch_bluegreen",
+            ],
+        )
+    )
 
     if deploy_fn is not None:
         call_attempts = [
             lambda: deploy_fn(config=config, project_dir=project_dir, active_color=active_color),
             lambda: deploy_fn(config, project_dir, active_color),
             lambda: deploy_fn(config=config, project_dir=project_dir),
-            lambda: deploy_fn(project_dir=project_dir),
+            lambda: deploy_fn(config=config),
             lambda: deploy_fn(config),
+            lambda: deploy_fn(project_dir=project_dir),
             lambda: deploy_fn(),
         ]
 
@@ -433,18 +596,41 @@ def run_bluegreen_deploy(
             try:
                 result = attempt()
 
-                if isinstance(result, dict):
-                    result.setdefault("active_color", result.get("active_color") or target_color)
-                    result.setdefault("live_url", LIVE_URL)
-                    result.setdefault("deployed", result.get("success", True))
-                    return result
+                if not isinstance(result, dict):
+                    result = {
+                        "success": True,
+                        "deployed": True,
+                        "active_color": target_color,
+                        "live_url": LIVE_URL,
+                    }
 
-                return {
-                    "success": True,
-                    "deployed": True,
-                    "active_color": target_color,
-                    "live_url": LIVE_URL,
-                }
+                result.setdefault("success", True)
+                result.setdefault("deployed", result.get("success", True))
+                result.setdefault("active_color", result.get("active_color") or target_color)
+                result.setdefault("live_url", result.get("live_url") or LIVE_URL)
+
+                if not bool(result.get("success", True)):
+                    reliability.record_deployment_event(
+                        run_id=run_id,
+                        event_type="update_bluegreen_deploy",
+                        status="failed",
+                        color=result.get("active_color") or target_color,
+                        version=result.get("version"),
+                        details=result,
+                    )
+                    raise RuntimeError(result.get("error") or "Blue/green deploy failed.")
+
+                reliability.record_deployment_event(
+                    run_id=run_id,
+                    event_type="update_bluegreen_deploy",
+                    status="success",
+                    color=result.get("active_color"),
+                    version=result.get("version"),
+                    details=result,
+                )
+
+                return result
+
             except TypeError as exc:
                 last_error = exc
                 continue
@@ -454,7 +640,7 @@ def run_bluegreen_deploy(
     compose_file = project_dir / "docker-compose.bluegreen.yml"
 
     if not compose_file.exists():
-        return {
+        result = {
             "success": True,
             "deployed": False,
             "skipped_deploy": True,
@@ -462,6 +648,16 @@ def run_bluegreen_deploy(
             "live_url": LIVE_URL,
             "message": "No docker-compose.bluegreen.yml found; deployment skipped.",
         }
+
+        reliability.record_deployment_event(
+            run_id=run_id,
+            event_type="update_bluegreen_deploy",
+            status="skipped",
+            color=active_color,
+            details=result,
+        )
+
+        return result
 
     target_project_dir = _copy_project_to_color(project_dir, target_color)
     target_compose = target_project_dir / "docker-compose.bluegreen.yml"
@@ -490,7 +686,7 @@ def run_bluegreen_deploy(
     build = subprocess.run(build_cmd, text=True, capture_output=True)
 
     if build.returncode != 0:
-        return {
+        result = {
             "success": False,
             "deployed": False,
             "active_color": active_color,
@@ -500,10 +696,24 @@ def run_bluegreen_deploy(
             "stderr": build.stderr,
         }
 
+        reliability.record_deployment_event(
+            run_id=run_id,
+            event_type="update_bluegreen_deploy",
+            status="failed",
+            color=target_color,
+            details=result,
+        )
+
+        raise RuntimeError(
+            "docker build failed\n\n"
+            f"STDOUT:\n{build.stdout}\n\n"
+            f"STDERR:\n{build.stderr}"
+        )
+
     up = subprocess.run(up_cmd, text=True, capture_output=True)
 
     if up.returncode != 0:
-        return {
+        result = {
             "success": False,
             "deployed": False,
             "active_color": active_color,
@@ -513,6 +723,20 @@ def run_bluegreen_deploy(
             "stderr": up.stderr,
         }
 
+        reliability.record_deployment_event(
+            run_id=run_id,
+            event_type="update_bluegreen_deploy",
+            status="failed",
+            color=target_color,
+            details=result,
+        )
+
+        raise RuntimeError(
+            "docker compose up failed\n\n"
+            f"STDOUT:\n{up.stdout}\n\n"
+            f"STDERR:\n{up.stderr}"
+        )
+
     _write_json(
         PROJECT_ROOT / "bluegreen_state.json",
         {
@@ -521,15 +745,41 @@ def run_bluegreen_deploy(
         },
     )
 
-    return {
+    result = {
         "success": True,
         "deployed": True,
         "active_color": target_color,
         "live_url": LIVE_URL,
     }
 
+    reliability.record_deployment_event(
+        run_id=run_id,
+        event_type="update_bluegreen_deploy",
+        status="success",
+        color=target_color,
+        details=result,
+    )
+
+    return result
+
 
 def _save_latest_config(config: dict[str, Any], active_color: str | None = None) -> None:
+    save_fn = _get_callable(
+        "core.project_store",
+        [
+            "save_current_config",
+            "save_project_config",
+            "save_config",
+            "write_current_config",
+        ],
+    )
+
+    if save_fn is not None:
+        try:
+            _call_flex(save_fn, config)
+        except Exception:
+            pass
+
     _write_json(PROJECT_ROOT / "active_config.json", config)
     _write_json(PROJECT_ROOT / "gateway_config.json", config)
 
@@ -537,7 +787,11 @@ def _save_latest_config(config: dict[str, Any], active_color: str | None = None)
         _write_json(DEFAULT_BLUEGREEN_ROOT / active_color / "active_config.json", config)
 
 
-def _should_skip_deploy(changed: bool, understood: bool, change_summary: list[str]) -> bool:
+def _should_skip_deploy(
+    changed: bool,
+    understood: bool,
+    change_summary: list[str],
+) -> bool:
     if changed:
         return False
 
@@ -555,101 +809,200 @@ def run_update_graph(prompt: str) -> dict[str, Any]:
     load_dotenv()
 
     prompt = prompt or ""
+    reliability = ReliabilityBrain()
+    run_id = reliability.start_run(prompt, flow="update")
+    stage = "load_active_config"
+    active_color = "blue"
+    active_config: dict[str, Any] | None = None
+    change_summary: list[str] = []
 
-    active_config, active_color = load_active_config()
+    try:
+        active_config, active_color = load_active_config()
 
-    update_result = update_prompt_to_config(active_config, prompt)
+        stage = "update_prompt_to_config"
+        update_result = update_prompt_to_config(active_config, prompt)
 
-    if not isinstance(update_result, dict):
-        update_result = {
-            "config": active_config,
-            "change_summary": ["No effective config changes detected."],
-            "changed": False,
-            "understood": False,
+        if not isinstance(update_result, dict):
+            update_result = {
+                "config": active_config,
+                "change_summary": ["No effective config changes detected."],
+                "changed": False,
+                "understood": False,
+            }
+
+        updated_config = update_result.get("config", active_config)
+
+        change_summary = _normalize_summary(
+            update_result.get("change_summary")
+            or update_result.get("summary")
+            or []
+        )
+
+        changed = bool(update_result.get("changed", False))
+        understood = bool(update_result.get("understood", False))
+
+        if not change_summary:
+            change_summary = ["No effective config changes detected."]
+
+        change_summary = _dedupe_summary(change_summary)
+
+        if _should_skip_deploy(changed, understood, change_summary):
+            reliability.finish_run(
+                run_id,
+                status="success",
+                metadata={
+                    "skipped_deploy": True,
+                    "reason": "no_effective_config_change",
+                    "active_color": active_color,
+                },
+            )
+
+            return {
+                "success": True,
+                "deployed": False,
+                "skipped_deploy": True,
+                "active_color": active_color,
+                "live_url": LIVE_URL,
+                "config": active_config,
+                "change_summary": change_summary,
+                "run_id": run_id,
+            }
+
+        stage = "security"
+        secured_config = run_security(updated_config, prompt)
+
+        stage = "config_preflight"
+        run_config_preflight(secured_config)
+
+        stage = "project_writer"
+        project_dir = run_project_writer(secured_config)
+
+        if not isinstance(project_dir, Path):
+            project_dir = GENERATED_PROJECT_DIR
+
+        stage = "container_files"
+        run_container_files(secured_config)
+
+        stage = "cargo_check"
+        run_cargo_check(prompt, secured_config, project_dir)
+
+        stage = "bluegreen_deploy"
+        deploy_result = run_bluegreen_deploy(
+            config=secured_config,
+            project_dir=project_dir,
+            active_color=active_color,
+            run_id=run_id,
+        )
+
+        if not isinstance(deploy_result, dict):
+            deploy_result = {}
+
+        deployed = bool(
+            deploy_result.get("deployed")
+            or deploy_result.get("success")
+            or deploy_result.get("deployment_success")
+        )
+
+        new_active_color = (
+            deploy_result.get("active_color")
+            or deploy_result.get("color")
+            or _inactive_color(active_color)
+        )
+
+        if deployed:
+            _save_latest_config(secured_config, str(new_active_color))
+
+        success = bool(deploy_result.get("success", deployed))
+
+        reliability.finish_run(
+            run_id,
+            status="success" if success else "failed",
+            metadata={
+                "deployed": deployed,
+                "active_color": new_active_color if deployed else active_color,
+                "live_url": deploy_result.get("live_url") or deploy_result.get("url") or LIVE_URL,
+                "change_summary": change_summary,
+            },
+        )
+
+        result = {
+            "success": success,
+            "deployed": deployed,
+            "active_color": new_active_color if deployed else active_color,
+            "live_url": deploy_result.get("live_url") or deploy_result.get("url") or LIVE_URL,
+            "config": secured_config,
+            "change_summary": change_summary,
+            "run_id": run_id,
         }
 
-    updated_config = update_result.get("config", active_config)
-    change_summary = _normalize_summary(
-        update_result.get("change_summary")
-        or update_result.get("summary")
-        or []
-    )
+        if deploy_result.get("error"):
+            result["error"] = deploy_result["error"]
 
-    changed = bool(update_result.get("changed", False))
-    understood = bool(update_result.get("understood", False))
+        if deploy_result.get("stdout"):
+            result["stdout"] = deploy_result["stdout"]
 
-    if not change_summary:
-        change_summary = ["No effective config changes detected."]
+        if deploy_result.get("stderr"):
+            result["stderr"] = deploy_result["stderr"]
 
-    change_summary = _dedupe_summary(change_summary)
+        return result
 
-    # Critical fix:
-    # If the user requested an understood operation that is a no-op/duplicate,
-    # preserve the agent's summary and skip build/deploy.
-    if _should_skip_deploy(changed, understood, change_summary):
+    except Exception as exc:
+        failure_stage = _stage_for_exception(stage, exc)
+
+        traffic_switched = False
+
+        reliability_result = reliability.record_failure(
+            run_id=run_id,
+            stage=failure_stage,
+            error=exc,
+            evidence={
+                "prompt": prompt,
+                "active_color": active_color,
+                "active_config": active_config or {},
+                "change_summary": change_summary,
+            },
+            traffic_switched=traffic_switched,
+            finish_run=True,
+        )
+
+        print("")
+        print(reliability_result.report)
+
+        if failure_stage == "config_preflight":
+            print("")
+            print("I could not continue because config-level preflight failed.")
+            print("No project was built.")
+            print("No deployment was attempted.")
+            print("No traffic was switched.")
+        elif failure_stage == "cargo_check":
+            print("")
+            print("I could not continue because generated Rust did not pass cargo check.")
+            print("No deployment was attempted.")
+            print("No traffic was switched.")
+        elif failure_stage == "bluegreen_deploy":
+            print("")
+            print("I could not complete blue/green deployment.")
+            print("The previous active color should remain live.")
+        else:
+            print("")
+            print("I could not complete the update flow.")
+            print("The reliability report above contains the root-cause classification.")
+
         return {
-            "success": True,
+            "success": False,
             "deployed": False,
-            "skipped_deploy": True,
+            "skipped_deploy": False,
             "active_color": active_color,
             "live_url": LIVE_URL,
-            "config": active_config,
-            "change_summary": change_summary,
+            "config": active_config or {},
+            "change_summary": change_summary or ["Update failed before deployment."],
+            "error": str(exc),
+            "failed_node": failure_stage,
+            "reliability_report": reliability_result.report,
+            "incident_id": reliability_result.incident_id,
+            "root_cause": reliability_result.classification.root_cause,
+            "run_id": run_id,
         }
-
-    secured_config = run_security(updated_config, prompt)
-    run_config_preflight(secured_config)
-
-    project_dir = run_project_writer(secured_config)
-
-    if not isinstance(project_dir, Path):
-        project_dir = GENERATED_PROJECT_DIR
-
-    run_cargo_check(project_dir)
-
-    deploy_result = run_bluegreen_deploy(
-        config=secured_config,
-        project_dir=project_dir,
-        active_color=active_color,
-    )
-
-    if not isinstance(deploy_result, dict):
-        deploy_result = {}
-
-    deployed = bool(
-        deploy_result.get("deployed")
-        or deploy_result.get("success")
-        or deploy_result.get("deployment_success")
-    )
-
-    new_active_color = (
-        deploy_result.get("active_color")
-        or deploy_result.get("color")
-        or _inactive_color(active_color)
-    )
-
-    if deployed:
-        _save_latest_config(secured_config, str(new_active_color))
-
-    result = {
-        "success": bool(deploy_result.get("success", deployed)),
-        "deployed": deployed,
-        "active_color": new_active_color if deployed else active_color,
-        "live_url": deploy_result.get("live_url") or deploy_result.get("url") or LIVE_URL,
-        "config": secured_config,
-        "change_summary": change_summary,
-    }
-
-    if deploy_result.get("error"):
-        result["error"] = deploy_result["error"]
-
-    if deploy_result.get("stdout"):
-        result["stdout"] = deploy_result["stdout"]
-
-    if deploy_result.get("stderr"):
-        result["stderr"] = deploy_result["stderr"]
-
-    return result
 
 
 def run_update_flow(prompt: str) -> dict[str, Any]:
@@ -661,4 +1014,8 @@ def update_gateway_flow(prompt: str) -> dict[str, Any]:
 
 
 def run(prompt: str) -> dict[str, Any]:
+    return run_update_graph(prompt)
+
+
+def main(prompt: str) -> dict[str, Any]:
     return run_update_graph(prompt)

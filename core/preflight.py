@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import importlib.util
 import os
 import shutil
@@ -5,6 +7,7 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +34,16 @@ PACKAGE_INIT_DIRS = [
     "core",
     "orchestration",
 ]
+
+
+class PreflightError(RuntimeError):
+    def __init__(self, message: str, errors: list[dict[str, Any]]):
+        super().__init__(message)
+        self.errors = errors
+
+
+class ConfigPreflightError(PreflightError):
+    pass
 
 
 def run_command(command, cwd=None):
@@ -287,7 +300,191 @@ def check_port_available(port: int):
     }
 
 
-def print_failures(errors):
+def extract_port_from_upstream(upstream: Any) -> int | None:
+    text = str(upstream or "").strip()
+    text = text.replace("http://", "").replace("https://", "").rstrip("/")
+
+    if "/" in text:
+        text = text.split("/", 1)[0]
+
+    if ":" not in text:
+        return None
+
+    port_text = text.rsplit(":", 1)[-1]
+
+    if not port_text.isdigit():
+        return None
+
+    port = int(port_text)
+
+    if 1 <= port <= 65535:
+        return port
+
+    return None
+
+
+def route_upstreams(route: dict[str, Any]) -> list[str]:
+    upstreams: list[str] = []
+
+    if route.get("upstream"):
+        upstreams.append(str(route["upstream"]))
+
+    if route.get("backend"):
+        upstreams.append(str(route["backend"]))
+
+    if route.get("target"):
+        upstreams.append(str(route["target"]))
+
+    raw_upstreams = route.get("upstreams")
+
+    if isinstance(raw_upstreams, list):
+        for item in raw_upstreams:
+            if isinstance(item, str):
+                upstreams.append(item)
+            elif isinstance(item, dict):
+                value = (
+                    item.get("address")
+                    or item.get("upstream")
+                    or item.get("backend")
+                    or item.get("target")
+                    or item.get("url")
+                )
+
+                if value:
+                    upstreams.append(str(value))
+
+    load_balancer = route.get("load_balancer")
+
+    if isinstance(load_balancer, dict):
+        lb_upstreams = load_balancer.get("upstreams")
+
+        if isinstance(lb_upstreams, list):
+            for item in lb_upstreams:
+                if isinstance(item, str):
+                    upstreams.append(item)
+                elif isinstance(item, dict):
+                    value = (
+                        item.get("address")
+                        or item.get("upstream")
+                        or item.get("backend")
+                        or item.get("target")
+                        or item.get("url")
+                    )
+
+                    if value:
+                        upstreams.append(str(value))
+
+    # De-dupe while preserving order.
+    seen: set[str] = set()
+    unique: list[str] = []
+
+    for upstream in upstreams:
+        if upstream not in seen:
+            unique.append(upstream)
+            seen.add(upstream)
+
+    return unique
+
+
+def check_proxy_backend_port_conflict(config: dict[str, Any]):
+    """
+    Prevents this broken setup:
+
+      gateway/listen port: 3000
+      backend/upstream:    127.0.0.1:3000
+
+    That causes Pingora and the backend to fight for the same port.
+
+    This check must stay enabled in both create and update flows.
+    """
+
+    try:
+        proxy_port = int(
+            config.get("port")
+            or config.get("listen_port")
+            or config.get("proxy_port")
+            or config.get("public_port")
+            or 0
+        )
+    except Exception:
+        return {
+            "ok": True,
+            "message": "Proxy port not available for conflict check.",
+            "fix": None,
+        }
+
+    if not (1 <= proxy_port <= 65535):
+        return {
+            "ok": True,
+            "message": "Proxy port is not valid, skipping backend conflict check.",
+            "fix": None,
+        }
+
+    routes = config.get("routes") or []
+
+    if not isinstance(routes, list):
+        return {
+            "ok": True,
+            "message": "Routes are not a list, skipping backend conflict check.",
+            "fix": None,
+        }
+
+    conflicts = []
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+
+        route_path = str(
+            route.get("path")
+            or route.get("prefix")
+            or route.get("route")
+            or "/"
+        )
+
+        for upstream in route_upstreams(route):
+            upstream_port = extract_port_from_upstream(upstream)
+
+            if upstream_port == proxy_port:
+                conflicts.append(
+                    {
+                        "route": route_path,
+                        "upstream": upstream,
+                        "port": upstream_port,
+                    }
+                )
+
+    if not conflicts:
+        return {
+            "ok": True,
+            "message": "No proxy/backend port conflicts detected.",
+            "fix": None,
+        }
+
+    conflict_lines = "\n".join(
+        f"- {item['route']} -> {item['upstream']}"
+        for item in conflicts
+    )
+
+    return {
+        "ok": False,
+        "message": (
+            f"Proxy/backend port conflict detected. "
+            f"The gateway is configured to listen on port {proxy_port}, "
+            f"but one or more backends also use port {proxy_port}."
+        ),
+        "fix": (
+            f"Conflicting route(s):\n\n"
+            f"{conflict_lines}\n\n"
+            f"Use a different gateway/listen port, for example 8088, "
+            f"or use a different backend port.\n\n"
+            f"Example:\n\n"
+            f'python main.py "create proxy on port 8088 with / to backend {proxy_port}"'
+        ),
+    }
+
+
+def print_failures(errors: list[dict[str, Any]]):
     print("")
     print("❌ Preflight failed")
 
@@ -295,14 +492,17 @@ def print_failures(errors):
         print("")
         print(f"- {error['message']}")
         print("")
-        print(error["fix"])
+
+        fix = error.get("fix")
+        if fix:
+            print(fix)
 
     print("")
 
 
 def preflight_check(use_docker: bool = True, use_compose: bool = True):
     """
-    Agent 0 — Preflight Doctor
+    Preflight Doctor.
 
     Runs before prompt/config generation.
     Detects environment problems before the generator starts.
@@ -343,31 +543,77 @@ def preflight_check(use_docker: bool = True, use_compose: bool = True):
 
     if errors:
         print_failures(errors)
-        raise RuntimeError("Preflight checks failed.")
+        raise PreflightError("Preflight checks failed.", errors)
 
     print("✅ Preflight checks passed")
 
 
-def preflight_check_config(config: dict, use_docker: bool = True, use_compose: bool = True):
+def preflight_check_config(
+    config: dict[str, Any],
+    use_docker: bool = True,
+    use_compose: bool = True,
+    check_listen_port_available: bool = True,
+):
     """
     Runs after validation/security, when we know the requested proxy/backend ports.
+
+    check_listen_port_available:
+      True:
+        create/local mode should fail if the gateway listen port is already used.
+
+      False:
+        update/blue-green mode may allow the public/edge port to already be live.
+
+    Important:
+      Proxy/backend same-port conflict is still checked even when
+      check_listen_port_available=False.
     """
 
     print("🧪 Running config-level preflight checks...")
 
     errors = []
 
-    proxy_port = config["port"]
+    try:
+        proxy_port = int(
+            config.get("port")
+            or config.get("listen_port")
+            or config.get("proxy_port")
+            or config.get("public_port")
+            or 0
+        )
+    except Exception:
+        proxy_port = 0
 
-    # In Compose/predeploy mode, old compose stacks are usually removed automatically.
-    # Still warn clearly if something else is occupying the public proxy port.
-    port_result = check_port_available(proxy_port)
+    conflict_result = check_proxy_backend_port_conflict(config)
 
-    if not port_result["ok"]:
-        errors.append(port_result)
+    if not conflict_result["ok"]:
+        errors.append(conflict_result)
+
+    if proxy_port:
+        if check_listen_port_available:
+            port_result = check_port_available(proxy_port)
+
+            if not port_result["ok"]:
+                errors.append(port_result)
+        else:
+            print(
+                f"ℹ️ Skipping listen-port availability check for port {proxy_port} "
+                f"because update/blue-green mode may already own it."
+            )
+    else:
+        errors.append(
+            {
+                "message": "Gateway/proxy port is missing or invalid.",
+                "fix": (
+                    "Provide a valid gateway port.\n\n"
+                    "Example:\n\n"
+                    'python main.py "create proxy on port 8088 with / to backend 3000"'
+                ),
+            }
+        )
 
     if errors:
         print_failures(errors)
-        raise RuntimeError("Config-level preflight checks failed.")
+        raise ConfigPreflightError("Config-level preflight checks failed.", errors)
 
     print("✅ Config-level preflight checks passed")

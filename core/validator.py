@@ -1,92 +1,605 @@
+from __future__ import annotations
+
+import copy
 import re
+from typing import Any
 
 
-def normalize_upstream(upstream: str) -> str:
-    upstream = upstream.strip()
-    upstream = upstream.replace("localhost", "127.0.0.1")
-    upstream = upstream.replace("http://", "")
-    upstream = upstream.replace("https://", "")
-    return upstream.rstrip("/")
+VALID_METHODS = {
+    "GET",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "OPTIONS",
+    "HEAD",
+}
 
 
-def get_upstream_port(upstream: str) -> int:
-    return int(upstream.split(":")[1])
+VALID_BALANCING_ALGORITHMS = {
+    "round_robin",
+    "random",
+    "weighted_round_robin",
+    "least_connections",
+    "ip_hash",
+}
 
 
-def validate_config(config: dict) -> dict:
-    if not isinstance(config, dict):
-        raise ValueError("Config must be a JSON object.")
+def normalize_path(path: Any) -> str:
+    text = str(path or "/").strip()
 
-    port = config.get("port")
+    if not text:
+        return "/"
 
-    if not isinstance(port, int):
-        raise ValueError("The server port must be a number, like 8080 or 9000.")
+    if not text.startswith("/"):
+        text = "/" + text
 
-    if port < 1024 or port > 65535:
-        raise ValueError("Use a port between 1024 and 65535.")
+    text = re.sub(r"[^a-zA-Z0-9/_\-.]", "", text)
 
-    routes = config.get("routes")
+    if not text:
+        return "/"
 
-    if not isinstance(routes, list) or len(routes) == 0:
-        raise ValueError(
-            "I could not find where traffic should go. "
-            "Example: create server on port 9000 and send traffic to backend 4000"
+    if not text.startswith("/"):
+        text = "/" + text
+
+    if len(text) > 1:
+        text = text.rstrip("/")
+
+    return text
+
+
+def normalize_port(value: Any, default: int = 3000) -> int:
+    try:
+        port = int(value)
+    except Exception:
+        return default
+
+    if 1 <= port <= 65535:
+        return port
+
+    return default
+
+
+def normalize_upstream_address(value: Any) -> str:
+    text = str(value or "127.0.0.1:3000").strip()
+
+    text = text.replace("http://", "")
+    text = text.replace("https://", "")
+    text = text.rstrip("/")
+
+    if "/" in text:
+        text = text.split("/", 1)[0]
+
+    if ":" not in text:
+        port = normalize_port(text, default=3000)
+        return f"127.0.0.1:{port}"
+
+    host, port_text = text.rsplit(":", 1)
+
+    host = host.strip()
+    port = normalize_port(port_text, default=3000)
+
+    if host == "localhost":
+        host = "127.0.0.1"
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", host):
+        host = "127.0.0.1"
+
+    return f"{host}:{port}"
+
+
+def split_upstream_values(value: Any) -> list[Any]:
+    """
+    Handles bad intermediate forms like:
+
+        "127.0.0.1:9101,127.0.0.1:9102,127.0.0.1:9103"
+
+    and converts them back into separate upstream entries.
+    """
+
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return value
+
+    if isinstance(value, tuple):
+        return list(value)
+
+    text = str(value).strip()
+
+    if not text:
+        return []
+
+    if "," in text:
+        return [
+            item.strip()
+            for item in text.split(",")
+            if item.strip()
+        ]
+
+    return [text]
+
+
+def normalize_upstream_item(item: Any) -> dict[str, Any]:
+    """
+    Internal canonical upstream format:
+
+        {
+          "address": "127.0.0.1:9101",
+          "weight": 1
+        }
+    """
+
+    if isinstance(item, dict):
+        address = (
+            item.get("address")
+            or item.get("upstream")
+            or item.get("backend")
+            or item.get("target")
+            or item.get("url")
+            or "127.0.0.1:3000"
         )
 
-    cleaned_routes = []
-    seen_paths = set()
+        try:
+            weight = int(item.get("weight", 1))
+        except Exception:
+            weight = 1
 
-    for route in routes:
-        if not isinstance(route, dict):
-            raise ValueError("Each route must be an object with path and upstream.")
+        if weight < 1:
+            weight = 1
 
-        path = route.get("path")
-        upstream = route.get("upstream")
+        return {
+            "address": normalize_upstream_address(address),
+            "weight": weight,
+        }
 
-        if not isinstance(path, str) or not path.startswith("/"):
-            raise ValueError("Each route needs a path, like / or /api.")
+    return {
+        "address": normalize_upstream_address(item),
+        "weight": 1,
+    }
 
-        if not re.match(r"^/[a-zA-Z0-9/_-]*$", path):
-            raise ValueError(
-                f"Invalid route path '{path}'. "
-                "Paths can only contain letters, numbers, /, _, and -."
-            )
 
-        if not isinstance(upstream, str):
-            raise ValueError("Each route needs a backend, like localhost:3000.")
+def extract_route_upstreams(route: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Extracts upstreams from many accepted input shapes.
 
-        path = path.rstrip("/") if path != "/" else "/"
+    Supports:
+      "upstream": "127.0.0.1:9101"
+      "upstream": "127.0.0.1:9101,127.0.0.1:9102"
+      "upstreams": ["127.0.0.1:9101", "127.0.0.1:9102"]
+      "upstreams": [{"address": "127.0.0.1:9101", "weight": 5}]
+      "backends": [...]
+      "backend_upstreams": [...]
+    """
 
-        if path in seen_paths:
-            raise ValueError(f"Duplicate route path '{path}' is not allowed.")
+    raw_items: list[Any] = []
 
-        seen_paths.add(path)
+    if isinstance(route.get("upstreams"), list):
+        raw_items.extend(route["upstreams"])
 
-        upstream = normalize_upstream(upstream)
+    if isinstance(route.get("backends"), list):
+        raw_items.extend(route["backends"])
 
-        if not re.match(r"^(127\.0\.0\.1|0\.0\.0\.0):[0-9]{2,5}$", upstream):
-            raise ValueError(
-                f"Unsafe backend '{upstream}'. "
-                "For now, only local backends are allowed."
-            )
+    if isinstance(route.get("backend_upstreams"), list):
+        raw_items.extend(route["backend_upstreams"])
 
-        upstream_port = get_upstream_port(upstream)
+    raw_items.extend(split_upstream_values(route.get("upstream")))
+    raw_items.extend(split_upstream_values(route.get("backend")))
+    raw_items.extend(split_upstream_values(route.get("target")))
 
-        if upstream_port < 1024 or upstream_port > 65535:
-            raise ValueError(
-                f"Backend port {upstream_port} must be between 1024 and 65535."
-            )
+    upstreams: list[dict[str, Any]] = []
+    seen: set[str] = set()
 
-        cleaned_routes.append(
+    for item in raw_items:
+        if isinstance(item, str) and "," in item:
+            for part in split_upstream_values(item):
+                upstream = normalize_upstream_item(part)
+                address = upstream["address"]
+
+                if address not in seen:
+                    upstreams.append(upstream)
+                    seen.add(address)
+
+            continue
+
+        upstream = normalize_upstream_item(item)
+        address = upstream["address"]
+
+        if address not in seen:
+            upstreams.append(upstream)
+            seen.add(address)
+
+    if not upstreams:
+        upstreams.append(
             {
-                "path": path,
-                "upstream": upstream,
+                "address": "127.0.0.1:3000",
+                "weight": 1,
             }
         )
 
-    cleaned_routes.sort(key=lambda r: len(r["path"]), reverse=True)
+    return upstreams
 
-    return {
-        "port": port,
-        "routes": cleaned_routes,
+
+def upstream_addresses(route: dict[str, Any]) -> list[str]:
+    addresses: list[str] = []
+
+    for upstream in extract_route_upstreams(route):
+        address = upstream["address"]
+
+        if address not in addresses:
+            addresses.append(address)
+
+    return addresses
+
+
+def normalize_balancing(value: Any, upstream_count: int = 1) -> str | None:
+    text = str(value or "").strip().lower()
+    text = text.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "rr": "round_robin",
+        "roundrobin": "round_robin",
+        "round_robin": "round_robin",
+
+        "rand": "random",
+        "random": "random",
+
+        "wrr": "weighted_round_robin",
+        "weighted": "weighted_round_robin",
+        "weighted_rr": "weighted_round_robin",
+        "weighted_roundrobin": "weighted_round_robin",
+        "weighted_round_robin": "weighted_round_robin",
+
+        "lc": "least_connections",
+        "least_conn": "least_connections",
+        "leastconn": "least_connections",
+        "least_connection": "least_connections",
+        "least_connections": "least_connections",
+
+        "iphash": "ip_hash",
+        "ip_hash": "ip_hash",
+        "source_ip_hash": "ip_hash",
+        "sticky": "ip_hash",
+        "sticky_session": "ip_hash",
     }
+
+    normalized = aliases.get(text)
+
+    if normalized in VALID_BALANCING_ALGORITHMS:
+        return normalized
+
+    if upstream_count > 1:
+        return "round_robin"
+
+    return None
+
+
+def _route_declares_weights(upstreams: list[dict[str, Any]]) -> bool:
+    return any(int(item.get("weight", 1)) != 1 for item in upstreams)
+
+
+def _format_upstreams_for_route(
+    upstreams: list[dict[str, Any]],
+    balancing: str | None,
+) -> list[str] | list[dict[str, Any]]:
+    """
+    For normal algorithms, keep upstreams as list[str]:
+
+        ["127.0.0.1:9101", "127.0.0.1:9102"]
+
+    For weighted_round_robin, preserve weights:
+
+        [
+          {"address": "127.0.0.1:9101", "weight": 5},
+          {"address": "127.0.0.1:9102", "weight": 1}
+        ]
+    """
+
+    if balancing == "weighted_round_robin":
+        return [
+            {
+                "address": item["address"],
+                "weight": int(item.get("weight", 1)),
+            }
+            for item in upstreams
+        ]
+
+    return [item["address"] for item in upstreams]
+
+
+def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
+    path = normalize_path(
+        route.get("path")
+        or route.get("prefix")
+        or route.get("route")
+        or "/"
+    )
+
+    upstreams = extract_route_upstreams(route)
+    addresses = [item["address"] for item in upstreams]
+    first_address = addresses[0]
+
+    requested_balancing = (
+        route.get("balancing")
+        or route.get("algorithm")
+        or route.get("lb_algorithm")
+        or route.get("load_balancing")
+    )
+
+    balancing = normalize_balancing(
+        requested_balancing,
+        upstream_count=len(addresses),
+    )
+
+    if _route_declares_weights(upstreams) and len(addresses) > 1:
+        balancing = "weighted_round_robin"
+
+    normalized = copy.deepcopy(route)
+    normalized["path"] = path
+    normalized["upstream"] = first_address
+
+    # Backward compatibility for older tests/agents.
+    normalized["backend"] = first_address
+
+    if len(addresses) > 1:
+        normalized["balancing"] = balancing or "round_robin"
+        normalized["upstreams"] = _format_upstreams_for_route(
+            upstreams,
+            normalized["balancing"],
+        )
+    else:
+        normalized.pop("upstreams", None)
+
+        # A single backend does not need a balancing algorithm.
+        normalized.pop("balancing", None)
+
+    normalized.pop("algorithm", None)
+    normalized.pop("lb_algorithm", None)
+    normalized.pop("load_balancing", None)
+    normalized.pop("strategy", None)
+    normalized.pop("backends", None)
+    normalized.pop("backend_upstreams", None)
+    normalized.pop("target", None)
+    normalized.pop("url", None)
+
+    return normalized
+
+
+def merge_duplicate_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Duplicate same-path routes with different upstreams become one route.
+
+    Example:
+
+      /users -> 9101
+      /users -> 9102
+
+    becomes:
+
+      /users -> upstreams [9101, 9102]
+    """
+
+    ordered_paths: list[str] = []
+    by_path: dict[str, dict[str, Any]] = {}
+    upstreams_by_path: dict[str, list[dict[str, Any]]] = {}
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+
+        normalized = normalize_route(route)
+        path = normalized["path"]
+
+        if path not in by_path:
+            by_path[path] = normalized
+            upstreams_by_path[path] = []
+            ordered_paths.append(path)
+
+        for upstream in extract_route_upstreams(normalized):
+            address = upstream["address"]
+
+            existing = next(
+                (
+                    item
+                    for item in upstreams_by_path[path]
+                    if item["address"] == address
+                ),
+                None,
+            )
+
+            if existing is None:
+                upstreams_by_path[path].append(upstream)
+            else:
+                existing["weight"] = max(
+                    int(existing.get("weight", 1)),
+                    int(upstream.get("weight", 1)),
+                )
+
+    output: list[dict[str, Any]] = []
+
+    for path in ordered_paths:
+        route = copy.deepcopy(by_path[path])
+        upstreams = upstreams_by_path[path]
+
+        if not upstreams:
+            upstreams = [
+                {
+                    "address": route.get("upstream", "127.0.0.1:3000"),
+                    "weight": 1,
+                }
+            ]
+
+        addresses = [item["address"] for item in upstreams]
+
+        route["path"] = path
+        route["upstream"] = addresses[0]
+        route["backend"] = addresses[0]
+
+        balancing = normalize_balancing(
+            route.get("balancing")
+            or route.get("algorithm")
+            or route.get("lb_algorithm")
+            or route.get("load_balancing"),
+            upstream_count=len(addresses),
+        )
+
+        if _route_declares_weights(upstreams) and len(addresses) > 1:
+            balancing = "weighted_round_robin"
+
+        if len(addresses) > 1:
+            route["balancing"] = balancing or "round_robin"
+            route["upstreams"] = _format_upstreams_for_route(
+                upstreams,
+                route["balancing"],
+            )
+        else:
+            route.pop("upstreams", None)
+            route.pop("balancing", None)
+
+        route.pop("algorithm", None)
+        route.pop("lb_algorithm", None)
+        route.pop("load_balancing", None)
+        route.pop("strategy", None)
+        route.pop("backends", None)
+        route.pop("backend_upstreams", None)
+        route.pop("target", None)
+        route.pop("url", None)
+
+        output.append(route)
+
+    return output
+
+
+def normalize_security(config: dict[str, Any]) -> dict[str, Any]:
+    incoming = config.get("security")
+
+    if not isinstance(incoming, dict):
+        incoming = {}
+
+    security: dict[str, Any] = {}
+
+    methods = incoming.get("allowed_methods")
+
+    if isinstance(methods, list):
+        allowed = []
+
+        for method in methods:
+            upper = str(method).strip().upper()
+
+            if upper in VALID_METHODS and upper not in allowed:
+                allowed.append(upper)
+
+        security["allowed_methods"] = allowed or [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS",
+            "HEAD",
+        ]
+    else:
+        security["allowed_methods"] = [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS",
+            "HEAD",
+        ]
+
+    blocked_paths = incoming.get("blocked_paths")
+
+    security["blocked_paths"] = []
+
+    if isinstance(blocked_paths, list):
+        for path in blocked_paths:
+            fixed = normalize_path(path)
+
+            if fixed not in security["blocked_paths"]:
+                security["blocked_paths"].append(fixed)
+
+    numeric_defaults = {
+        "rate_limit_per_minute": 120,
+        "max_connections": 1000,
+        "max_request_body_bytes": 1048576,
+        "upstream_timeout_seconds": 30,
+    }
+
+    for key, default in numeric_defaults.items():
+        try:
+            value = int(incoming.get(key, default))
+        except Exception:
+            value = default
+
+        if value < 0:
+            value = default
+
+        security[key] = value
+
+    return security
+
+
+def validate_config(config: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        raise ValueError("Config must be a dictionary.")
+
+    validated = copy.deepcopy(config)
+
+    try:
+        port = int(
+            validated.get("port")
+            or validated.get("listen_port")
+            or validated.get("proxy_port")
+            or 8088
+        )
+    except Exception:
+        port = 8088
+
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Invalid gateway port: {port}")
+
+    validated["port"] = port
+
+    routes = validated.get("routes")
+
+    if not isinstance(routes, list):
+        raise ValueError("Config must contain routes as a list.")
+
+    normalized_routes = []
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+
+        normalized_routes.append(normalize_route(route))
+
+    if not normalized_routes:
+        raise ValueError("Config must contain at least one valid route.")
+
+    validated["routes"] = merge_duplicate_routes(normalized_routes)
+    validated["security"] = normalize_security(validated)
+
+    return validated
+
+
+def get_upstream_port(upstream: Any) -> int:
+    address = normalize_upstream_address(upstream)
+    port_text = address.rsplit(":", 1)[-1]
+    return int(port_text)
+
+
+__all__ = [
+    "validate_config",
+    "get_upstream_port",
+    "normalize_path",
+    "normalize_upstream_address",
+    "normalize_route",
+    "merge_duplicate_routes",
+    "extract_route_upstreams",
+    "upstream_addresses",
+    "normalize_balancing",
+    "VALID_BALANCING_ALGORITHMS",
+]

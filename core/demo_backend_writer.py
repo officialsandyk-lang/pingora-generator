@@ -2,298 +2,277 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
+import signal
+import socket
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 
-DEFAULT_DEMO_BACKEND = {
-    "enabled": True,
-    "generate_placeholder_files": True,
-    "overwrite_existing": False,
-}
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+HOST_DEMO_ROOT = PROJECT_ROOT / "tmp" / "host-demo-backends"
+HOST_DEMO_LOG_DIR = PROJECT_ROOT / "tmp" / "logs"
+HOST_DEMO_RUNTIME_DIR = PROJECT_ROOT / ".runtime" / "host-demo-backends"
 
 
-def normalize_path(path: Any) -> str:
-    path = str(path or "/").strip()
+def extract_port_from_upstream(value: Any) -> int | None:
+    text = str(value or "").strip()
+    text = text.replace("http://", "").replace("https://", "").rstrip("/")
 
-    if not path.startswith("/"):
-        path = "/" + path
+    match = re.search(r":(\d+)$", text)
+    if not match:
+        return None
 
-    path = re.sub(r"[^a-zA-Z0-9/_-]", "", path)
+    port = int(match.group(1))
 
-    if not path:
-        return "/"
+    if 1 <= port <= 65535:
+        return port
 
-    if not path.startswith("/"):
-        path = "/" + path
-
-    return path
+    return None
 
 
-def route_path_to_dirname(route_path: str) -> str:
+def extract_demo_backend_ports(config: dict[str, Any]) -> list[int]:
     """
-    Convert:
-      "/"        -> ""
-      "/users"  -> "users"
-      "/api/v1" -> "api/v1"
+    Extract every backend port from config.
+
+    Supports:
+      {"upstream": "host.docker.internal:9000"}
+      {"upstream": "host.docker.internal:9101,host.docker.internal:9102"}
+      {"upstreams": ["host.docker.internal:9101", "host.docker.internal:9102"]}
+      {"upstreams": [{"address": "host.docker.internal:9101"}]}
     """
-    route_path = normalize_path(route_path)
-
-    if route_path == "/":
-        return ""
-
-    return route_path.strip("/")
-
-
-def get_route_upstream(route: dict[str, Any]) -> str:
-    """
-    Supports old and new config shapes:
-
-      {"upstream": "127.0.0.1:3000"}
-
-    and:
-
-      {
-        "upstreams": [
-          {"address": "127.0.0.1:3000"}
-        ]
-      }
-    """
-    upstream = route.get("upstream")
-
-    if upstream:
-        return str(upstream)
-
-    upstreams = route.get("upstreams")
-
-    if isinstance(upstreams, list) and upstreams:
-        first = upstreams[0]
-
-        if isinstance(first, dict):
-            return str(first.get("address") or first.get("upstream") or "127.0.0.1:3000")
-
-        return str(first)
-
-    return "127.0.0.1:3000"
-
-
-def demo_backend_settings(config: dict[str, Any]) -> dict[str, Any]:
-    incoming = config.get("demo_backend")
-
-    if not isinstance(incoming, dict):
-        return dict(DEFAULT_DEMO_BACKEND)
-
-    settings = dict(DEFAULT_DEMO_BACKEND)
-    settings.update(incoming)
-
-    settings["enabled"] = bool(settings.get("enabled", True))
-    settings["generate_placeholder_files"] = bool(
-        settings.get("generate_placeholder_files", True)
-    )
-    settings["overwrite_existing"] = bool(settings.get("overwrite_existing", False))
-
-    return settings
-
-
-def render_index_html(
-    *,
-    route_path: str,
-    upstream: str,
-    port: int,
-    project_name: str = "AI Pingora Gateway",
-) -> str:
-    safe_route = html.escape(route_path)
-    safe_upstream = html.escape(upstream)
-    safe_project = html.escape(project_name)
-
-    return f"""<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <title>{safe_project} - {safe_route}</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {{
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 40px;
-      line-height: 1.5;
-      color: #111827;
-      background: #f9fafb;
-    }}
-    main {{
-      max-width: 760px;
-      background: white;
-      border: 1px solid #e5e7eb;
-      border-radius: 16px;
-      padding: 28px;
-      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.06);
-    }}
-    code {{
-      background: #f3f4f6;
-      padding: 2px 6px;
-      border-radius: 6px;
-    }}
-    .ok {{
-      color: #047857;
-      font-weight: 700;
-    }}
-  </style>
-</head>
-<body>
-  <main>
-    <h1 class="ok">✅ Route works: <code>{safe_route}</code></h1>
-    <p>This is demo backend content generated for local testing.</p>
-
-    <h2>Route</h2>
-    <p><code>{safe_route}</code></p>
-
-    <h2>Upstream</h2>
-    <p><code>{safe_upstream}</code></p>
-
-    <h2>Proxy</h2>
-    <p><code>http://127.0.0.1:{port}{safe_route}</code></p>
-
-    <p>You can replace this file with your own backend/static content later.</p>
-  </main>
-</body>
-</html>
-"""
-
-
-def render_route_metadata(
-    *,
-    route_path: str,
-    upstream: str,
-    route: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "route": route_path,
-        "upstream": upstream,
-        "generated_by": "AI Pingora Gateway demo backend writer",
-        "note": "This file is safe to replace with your own backend/static content.",
-        "route_config": route,
-    }
-
-
-def write_text_if_allowed(path: Path, content: str, *, overwrite: bool) -> bool:
-    """
-    Returns True if file was written.
-    Returns False if skipped because file already exists.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if path.exists() and not overwrite:
-        return False
-
-    path.write_text(content, encoding="utf-8")
-    return True
-
-
-def write_json_if_allowed(path: Path, data: dict[str, Any], *, overwrite: bool) -> bool:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if path.exists() and not overwrite:
-        return False
-
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-    return True
-
-
-def write_demo_backend_files(
-    config: dict[str, Any],
-    project_dir: str | Path,
-) -> dict[str, Any]:
-    """
-    Create route placeholder files for local demo/testing.
-
-    Example:
-      route /users   -> generated-pingora-proxy/users/index.html
-      route /orders  -> generated-pingora-proxy/orders/index.html
-      route /         -> generated-pingora-proxy/index.html
-
-    This does not overwrite existing files unless configured.
-
-    Config flag:
-
-      {
-        "demo_backend": {
-          "enabled": true,
-          "generate_placeholder_files": true,
-          "overwrite_existing": false
-        }
-      }
-    """
-    project_path = Path(project_dir).resolve()
-    settings = demo_backend_settings(config)
-
-    result: dict[str, Any] = {
-        "enabled": settings["enabled"],
-        "project_dir": str(project_path),
-        "created": [],
-        "skipped": [],
-    }
-
-    if not settings["enabled"]:
-        return result
-
-    if not settings["generate_placeholder_files"]:
-        return result
-
-    overwrite = settings["overwrite_existing"]
+    ports: list[int] = []
 
     routes = config.get("routes") or []
-    port = int(config.get("port") or config.get("listen_port") or config.get("proxy_port") or 9000)
 
     if not isinstance(routes, list):
-        return result
+        return ports
 
     for route in routes:
         if not isinstance(route, dict):
             continue
 
-        route_path = normalize_path(route.get("path") or route.get("prefix") or route.get("route"))
-        upstream = get_route_upstream(route)
+        candidates: list[Any] = []
 
-        dirname = route_path_to_dirname(route_path)
-        target_dir = project_path / dirname if dirname else project_path
+        for key in ("upstream", "backend", "target"):
+            value = route.get(key)
+            if value:
+                candidates.append(value)
 
-        index_path = target_dir / "index.html"
-        metadata_path = target_dir / "route.json"
+        upstreams = route.get("upstreams")
+        if isinstance(upstreams, list):
+            for item in upstreams:
+                if isinstance(item, dict):
+                    candidates.append(
+                        item.get("address")
+                        or item.get("upstream")
+                        or item.get("backend")
+                    )
+                else:
+                    candidates.append(item)
 
-        index_html = render_index_html(
-            route_path=route_path,
-            upstream=upstream,
-            port=port,
-        )
+        for candidate in candidates:
+            for part in str(candidate or "").split(","):
+                port = extract_port_from_upstream(part)
+                if port and port not in ports:
+                    ports.append(port)
 
-        metadata = render_route_metadata(
-            route_path=route_path,
-            upstream=upstream,
-            route=route,
-        )
+    return ports
 
-        wrote_index = write_text_if_allowed(index_path, index_html, overwrite=overwrite)
-        wrote_metadata = write_json_if_allowed(metadata_path, metadata, overwrite=overwrite)
 
-        if wrote_index or wrote_metadata:
-            result["created"].append(
-                {
-                    "route": route_path,
-                    "dir": str(target_dir),
-                    "index": str(index_path),
-                    "metadata": str(metadata_path),
-                }
-            )
-        else:
-            result["skipped"].append(
-                {
-                    "route": route_path,
-                    "dir": str(target_dir),
-                    "reason": "files already exist",
-                }
-            )
+def is_port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.25) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
-    return result
+
+def host_demo_backend_dir(port: int) -> Path:
+    return HOST_DEMO_ROOT / str(port)
+
+
+def host_demo_backend_pid_file(port: int) -> Path:
+    return HOST_DEMO_RUNTIME_DIR / f"backend-{port}.pid"
+
+
+def host_demo_backend_log_file(port: int) -> Path:
+    return HOST_DEMO_LOG_DIR / f"backend-{port}.log"
+
+
+def write_host_demo_backend_files(port: int) -> Path:
+    backend_dir = host_demo_backend_dir(port)
+    backend_dir.mkdir(parents=True, exist_ok=True)
+
+    index_path = backend_dir / "index.html"
+    health_path = backend_dir / "health.json"
+
+    index_path.write_text(
+        f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Demo Backend {port}</title>
+</head>
+<body>
+  <h1>✅ Demo Backend {port}</h1>
+  <p>This response came from backend port <strong>{port}</strong>.</p>
+  <p>Generated by AI Pingora Gateway.</p>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
+
+    health_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "backend_port": port,
+                "generated_by": "AI Pingora Gateway demo backend writer",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    return backend_dir
+
+
+def start_host_demo_backend(
+    port: int,
+    *,
+    bind_host: str = "0.0.0.0",
+) -> dict[str, Any]:
+    """
+    Starts a real Python webserver for docker_host testing.
+
+    bind_host is 0.0.0.0 so Docker containers can reach the host backend via:
+      host.docker.internal:PORT
+    """
+    HOST_DEMO_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    HOST_DEMO_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if is_port_open(port):
+        return {
+            "port": port,
+            "status": "already_running",
+            "started": False,
+            "url": f"http://127.0.0.1:{port}/",
+        }
+
+    backend_dir = write_host_demo_backend_files(port)
+    log_path = host_demo_backend_log_file(port)
+
+    log_handle = log_path.open("a", encoding="utf-8")
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "http.server",
+            str(port),
+            "--bind",
+            bind_host,
+            "--directory",
+            str(backend_dir),
+        ],
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        cwd=str(PROJECT_ROOT),
+        start_new_session=True,
+    )
+
+    host_demo_backend_pid_file(port).write_text(str(process.pid), encoding="utf-8")
+
+    return {
+        "port": port,
+        "status": "started",
+        "started": True,
+        "pid": process.pid,
+        "url": f"http://127.0.0.1:{port}/",
+        "bind_host": bind_host,
+        "directory": str(backend_dir),
+        "log": str(log_path),
+    }
+
+
+def stop_host_demo_backend(port: int) -> dict[str, Any]:
+    pid_path = host_demo_backend_pid_file(port)
+
+    if not pid_path.exists():
+        return {
+            "port": port,
+            "status": "not_managed",
+            "stopped": False,
+        }
+
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except Exception:
+        pid_path.unlink(missing_ok=True)
+        return {
+            "port": port,
+            "status": "bad_pid_file",
+            "stopped": False,
+        }
+
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+
+    pid_path.unlink(missing_ok=True)
+
+    return {
+        "port": port,
+        "status": "stopped",
+        "stopped": True,
+        "pid": pid,
+    }
+
+
+def ensure_host_demo_backend_servers(
+    config: dict[str, Any],
+    *,
+    bind_host: str = "0.0.0.0",
+) -> dict[str, Any]:
+    ports = extract_demo_backend_ports(config)
+
+    results = [
+        start_host_demo_backend(port, bind_host=bind_host)
+        for port in ports
+    ]
+
+    return {
+        "ports": ports,
+        "started": [
+            item for item in results if item.get("status") == "started"
+        ],
+        "already_running": [
+            item for item in results if item.get("status") == "already_running"
+        ],
+        "results": results,
+    }
+
+
+def stop_host_demo_backend_servers(config: dict[str, Any]) -> dict[str, Any]:
+    ports = extract_demo_backend_ports(config)
+
+    results = [
+        stop_host_demo_backend(port)
+        for port in ports
+    ]
+
+    return {
+        "ports": ports,
+        "results": results,
+    }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from typing import Any
 
@@ -14,6 +15,53 @@ from core.safety import (
     parse_update_cli_args,
     rewrite_confirmed_destructive_prompt,
 )
+
+
+BACKEND_UPDATE_PATTERN = re.compile(
+    r"\b(add|remove|delete)\s+(backend|upstream)\b",
+    flags=re.IGNORECASE,
+)
+
+LOAD_BALANCER_UPDATE_PATTERN = re.compile(
+    r"\b(balance|balanced|load[- ]?balance|load[- ]?balanced)\b",
+    flags=re.IGNORECASE,
+)
+
+ALGORITHM_UPDATE_PATTERN = re.compile(
+    r"\bset\s+/[A-Za-z0-9_.\-/]+\s+"
+    r"(algorithm|balancing|load[- ]?balancing)",
+    flags=re.IGNORECASE,
+)
+
+
+def _should_preserve_prompt(prompt: str) -> bool:
+    """
+    Some update prompts must not be passed through normalize_safe_route_prompt().
+
+    Example bug:
+      "remove backend 127.0.0.1:9104 from /users"
+
+    can be incorrectly normalized into:
+      "remove /backend"
+
+    So backend/upstream and load-balancer commands are passed through unchanged.
+    """
+
+    text = prompt.strip()
+
+    if BACKEND_UPDATE_PATTERN.search(text):
+        return True
+
+    if LOAD_BALANCER_UPDATE_PATTERN.search(text):
+        return True
+
+    if ALGORITHM_UPDATE_PATTERN.search(text):
+        return True
+
+    if "host.docker.internal:" in text:
+        return True
+
+    return False
 
 
 def _run_update_flow(prompt: str) -> dict[str, Any]:
@@ -77,9 +125,19 @@ def _print_update_summary(result: dict[str, Any]) -> None:
             print(f"✅ {text}")
         elif lower.startswith("updated route"):
             print(f"✅ {text}")
+        elif lower.startswith("removed backend"):
+            print(f"✅ {text}")
+        elif lower.startswith("added backend"):
+            print(f"✅ {text}")
+        elif lower.startswith("configured load balancer"):
+            print(f"✅ {text}")
+        elif lower.startswith("set ") and "algorithm" in lower:
+            print(f"✅ {text}")
         elif lower.startswith("security changed"):
             print(f"✅ {text}")
         elif "already absent" in lower:
+            print(f"ℹ️ {text}")
+        elif "already exists" in lower:
             print(f"ℹ️ {text}")
         elif "already existed" in lower:
             print(f"ℹ️ {text}")
@@ -134,6 +192,8 @@ def main() -> int:
         print("Examples:")
         print('  python update.py "add /inventory to backend 9001"')
         print('  python update.py "remove /admin"')
+        print('  python update.py "add backend 9104 to /users"')
+        print('  python update.py "remove backend 9104 from /users"')
         print('  python update.py "delete /analytics" --confirm')
         return 1
 
@@ -152,7 +212,10 @@ def main() -> int:
             destructive,
         )
     else:
-        effective_prompt = normalize_safe_route_prompt(command.prompt)
+        if _should_preserve_prompt(command.prompt):
+            effective_prompt = command.prompt.strip()
+        else:
+            effective_prompt = normalize_safe_route_prompt(command.prompt)
 
     if command.dry_run:
         print("🧪 Dry run requested.")

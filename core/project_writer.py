@@ -28,6 +28,15 @@ DEFAULT_DEMO_BACKEND = {
 }
 
 
+VALID_BALANCING_ALGORITHMS = {
+    "round_robin",
+    "random",
+    "weighted_round_robin",
+    "least_connections",
+    "ip_hash",
+}
+
+
 def rust_string(value: Any) -> str:
     return json.dumps(str(value))
 
@@ -45,6 +54,9 @@ def normalize_path(path: Any) -> str:
 
     if not path.startswith("/"):
         path = "/" + path
+
+    if len(path) > 1:
+        path = path.rstrip("/")
 
     return path
 
@@ -66,7 +78,6 @@ def normalize_upstream_address(value: Any) -> str:
 
     upstream = upstream.replace("http://", "")
     upstream = upstream.replace("https://", "")
-    upstream = upstream.replace("localhost", "127.0.0.1")
     upstream = upstream.rstrip("/")
 
     if "/" in upstream:
@@ -80,10 +91,53 @@ def normalize_upstream_address(value: Any) -> str:
     host = host.strip()
     port = normalize_port(port_text, default=3000)
 
-    if host not in {"127.0.0.1", "0.0.0.0", "host.docker.internal"}:
+    if host == "localhost":
+        host = "127.0.0.1"
+
+    # Allow localhost-style addresses, Docker service names, and DNS-style names.
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", host):
         host = "127.0.0.1"
 
     return f"{host}:{port}"
+
+
+def normalize_balancing(value: Any) -> str:
+    text = str(value or "round_robin").strip().lower()
+    text = text.replace("-", "_").replace(" ", "_")
+
+    aliases = {
+        "rr": "round_robin",
+        "roundrobin": "round_robin",
+        "round_robin": "round_robin",
+
+        "random": "random",
+        "rand": "random",
+
+        "weighted": "weighted_round_robin",
+        "weighted_rr": "weighted_round_robin",
+        "weighted_roundrobin": "weighted_round_robin",
+        "weighted_round_robin": "weighted_round_robin",
+        "wrr": "weighted_round_robin",
+
+        "least_connection": "least_connections",
+        "least_connections": "least_connections",
+        "least_conn": "least_connections",
+        "leastconn": "least_connections",
+        "lc": "least_connections",
+
+        "ip_hash": "ip_hash",
+        "iphash": "ip_hash",
+        "source_ip_hash": "ip_hash",
+        "sticky": "ip_hash",
+        "sticky_session": "ip_hash",
+    }
+
+    normalized = aliases.get(text, "round_robin")
+
+    if normalized not in VALID_BALANCING_ALGORITHMS:
+        return "round_robin"
+
+    return normalized
 
 
 def normalize_upstream_item(item: Any) -> dict[str, Any]:
@@ -97,6 +151,7 @@ def normalize_upstream_item(item: Any) -> dict[str, Any]:
         address = (
             item.get("address")
             or item.get("upstream")
+            or item.get("backend")
             or item.get("target")
             or item.get("url")
             or "127.0.0.1:3000"
@@ -122,18 +177,30 @@ def normalize_upstream_item(item: Any) -> dict[str, Any]:
 
 
 def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
-    path = normalize_path(route.get("path") or route.get("prefix") or route.get("route"))
+    path = normalize_path(
+        route.get("path")
+        or route.get("prefix")
+        or route.get("route")
+        or "/"
+    )
 
-    balancing = str(route.get("balancing") or route.get("strategy") or "round_robin").strip()
-
-    if balancing != "round_robin":
-        balancing = "round_robin"
+    balancing = normalize_balancing(
+        route.get("balancing")
+        or route.get("load_balancing")
+        or route.get("lb_algorithm")
+        or route.get("algorithm")
+        or route.get("strategy")
+        or "round_robin"
+    )
 
     upstreams_raw = route.get("upstreams")
 
     if upstreams_raw is None:
-        upstream = route.get("upstream") or "127.0.0.1:3000"
-        upstreams_raw = [upstream]
+        if route.get("backends") is not None:
+            upstreams_raw = route.get("backends")
+        else:
+            upstream = route.get("upstream") or route.get("backend") or "127.0.0.1:3000"
+            upstreams_raw = [upstream]
 
     if not isinstance(upstreams_raw, list):
         upstreams_raw = [upstreams_raw]
@@ -148,6 +215,14 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
         if address not in seen_addresses:
             upstreams.append(upstream)
             seen_addresses.add(address)
+        else:
+            for existing in upstreams:
+                if existing["address"] == address:
+                    existing["weight"] = max(
+                        int(existing.get("weight", 1)),
+                        int(upstream.get("weight", 1)),
+                    )
+                    break
 
     if not upstreams:
         upstreams = [
@@ -157,15 +232,170 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
             }
         ]
 
+    if len(upstreams) > 1 and any(int(item.get("weight", 1)) != 1 for item in upstreams):
+        balancing = "weighted_round_robin"
+
     fixed = dict(route)
     fixed["path"] = path
     fixed["balancing"] = balancing
     fixed["upstreams"] = upstreams
-
-    # Backward compatibility for older validator/agents.
     fixed["upstream"] = upstreams[0]["address"]
+    fixed["backend"] = upstreams[0]["address"]
+
+    fixed.pop("algorithm", None)
+    fixed.pop("lb_algorithm", None)
+    fixed.pop("load_balancing", None)
+    fixed.pop("strategy", None)
+    fixed.pop("backends", None)
+    fixed.pop("backend_upstreams", None)
+    fixed.pop("address", None)
+    fixed.pop("target", None)
+    fixed.pop("url", None)
 
     return fixed
+
+
+def route_upstream_addresses(route: dict[str, Any]) -> list[str]:
+    normalized = normalize_route(route)
+    addresses: list[str] = []
+
+    for upstream in normalized.get("upstreams", []):
+        if not isinstance(upstream, dict):
+            upstream = normalize_upstream_item(upstream)
+
+        address = normalize_upstream_address(
+            upstream.get("address")
+            or upstream.get("upstream")
+            or upstream.get("backend")
+            or "127.0.0.1:3000"
+        )
+
+        if address not in addresses:
+            addresses.append(address)
+
+    if not addresses:
+        addresses.append(normalize_upstream_address(normalized.get("upstream")))
+
+    return addresses
+
+
+def merge_routes_for_generation(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered_paths: list[str] = []
+    merged: dict[str, dict[str, Any]] = {}
+    upstreams_by_path: dict[str, list[dict[str, Any]]] = {}
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+
+        normalized = normalize_route(route)
+        path = normalized["path"]
+
+        if path not in merged:
+            merged[path] = normalized
+            upstreams_by_path[path] = []
+            ordered_paths.append(path)
+
+        if normalized.get("balancing"):
+            merged[path]["balancing"] = normalized["balancing"]
+
+        for upstream in normalized.get("upstreams", []):
+            if not isinstance(upstream, dict):
+                upstream = normalize_upstream_item(upstream)
+
+            address = normalize_upstream_address(upstream.get("address"))
+            weight = int(upstream.get("weight", 1) or 1)
+
+            if weight < 1:
+                weight = 1
+
+            existing = next(
+                (
+                    item
+                    for item in upstreams_by_path[path]
+                    if item["address"] == address
+                ),
+                None,
+            )
+
+            if existing is None:
+                upstreams_by_path[path].append(
+                    {
+                        "address": address,
+                        "weight": weight,
+                    }
+                )
+            else:
+                existing["weight"] = max(
+                    int(existing.get("weight", 1)),
+                    weight,
+                )
+
+    output: list[dict[str, Any]] = []
+
+    for path in ordered_paths:
+        route = dict(merged[path])
+        upstreams = upstreams_by_path[path]
+
+        if not upstreams:
+            upstreams = [
+                {
+                    "address": normalize_upstream_address(route.get("upstream")),
+                    "weight": 1,
+                }
+            ]
+
+        balancing = normalize_balancing(route.get("balancing"))
+
+        if len(upstreams) > 1 and any(int(item.get("weight", 1)) != 1 for item in upstreams):
+            balancing = "weighted_round_robin"
+
+        route["path"] = path
+        route["upstreams"] = upstreams
+        route["upstream"] = upstreams[0]["address"]
+        route["backend"] = upstreams[0]["address"]
+        route["balancing"] = balancing
+
+        output.append(route)
+
+    return output
+
+
+def collect_expected_upstream_addresses(config: dict[str, Any]) -> list[str]:
+    addresses: list[str] = []
+
+    routes = config.get("routes") or []
+
+    if not isinstance(routes, list):
+        return addresses
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+
+        for address in route_upstream_addresses(route):
+            if address not in addresses:
+                addresses.append(address)
+
+    return addresses
+
+
+def assert_rendered_rust_contains_upstreams(
+    *,
+    config: dict[str, Any],
+    main_rs: str,
+) -> None:
+    missing = []
+
+    for address in collect_expected_upstream_addresses(config):
+        if address not in main_rs:
+            missing.append(address)
+
+    if missing:
+        raise RuntimeError(
+            "Generated Rust is missing upstream address(es): "
+            + ", ".join(missing)
+        )
 
 
 def normalize_security(config: dict[str, Any]) -> dict[str, Any]:
@@ -237,19 +467,11 @@ def normalize_config_for_generation(config: dict[str, Any]) -> dict[str, Any]:
     )
 
     routes = fixed.get("routes") or []
-    seen_paths: dict[str, dict[str, Any]] = {}
+    normalized_routes: list[dict[str, Any]] = []
 
     if isinstance(routes, list):
-        for route in routes:
-            if not isinstance(route, dict):
-                continue
-
-            normalized = normalize_route(route)
-
-            # Last duplicate path wins.
-            seen_paths[normalized["path"]] = normalized
-
-    normalized_routes = list(seen_paths.values())
+        raw_routes = [route for route in routes if isinstance(route, dict)]
+        normalized_routes = merge_routes_for_generation(raw_routes)
 
     if not normalized_routes:
         normalized_routes = [
@@ -280,22 +502,21 @@ def route_path_to_dirname(route_path: str) -> str:
 
 
 def get_route_upstream(route: dict[str, Any]) -> str:
-    upstream = route.get("upstream")
+    addresses = route_upstream_addresses(route)
 
-    if upstream:
-        return str(upstream)
+    if not addresses:
+        return "127.0.0.1:3000"
 
-    upstreams = route.get("upstreams")
+    return addresses[0]
 
-    if isinstance(upstreams, list) and upstreams:
-        first = upstreams[0]
 
-        if isinstance(first, dict):
-            return str(first.get("address") or first.get("upstream") or "127.0.0.1:3000")
+def get_route_upstreams_display(route: dict[str, Any]) -> str:
+    addresses = route_upstream_addresses(route)
 
-        return str(first)
+    if not addresses:
+        return "127.0.0.1:3000"
 
-    return "127.0.0.1:3000"
+    return ", ".join(addresses)
 
 
 def demo_backend_settings(config: dict[str, Any]) -> dict[str, Any]:
@@ -376,7 +597,7 @@ def render_demo_route_index_html(
     <h2>Route</h2>
     <p><code>{safe_route}</code></p>
 
-    <h2>Upstream</h2>
+    <h2>Upstream(s)</h2>
     <p><code>{safe_upstream}</code></p>
 
     <h2>Proxy</h2>
@@ -413,7 +634,7 @@ def render_demo_home_index_html(
         href = route_path if route_path.endswith("/") else f"{route_path}/"
         safe_href = html.escape(href)
         safe_route = html.escape(route_path)
-        upstream = html.escape(get_route_upstream(route))
+        upstream = html.escape(get_route_upstreams_display(route))
 
         links.append(
             f"""
@@ -551,7 +772,7 @@ def write_demo_backend_files(
             continue
 
         route_path = normalize_path(route.get("path") or route.get("prefix") or route.get("route"))
-        upstream = get_route_upstream(route)
+        upstream = get_route_upstreams_display(route)
 
         dirname = route_path_to_dirname(route_path)
         target_dir = project_path / dirname if dirname else project_path
@@ -573,7 +794,9 @@ def write_demo_backend_files(
 
         metadata = {
             "route": route_path,
-            "upstream": upstream,
+            "upstream": get_route_upstream(route),
+            "upstreams": route_upstream_addresses(route),
+            "balancing": normalize_balancing(route.get("balancing")),
             "generated_by": "AI Pingora Gateway demo backend writer",
             "note": "This file is safe to replace with your own backend/static content.",
             "route_config": route,
@@ -600,8 +823,6 @@ def write_demo_backend_files(
                 }
             )
 
-    # Create a root route index file only when "/" exists in the config.
-    # Without a "/" route, Pingora correctly returns 404 for the homepage.
     if has_root_route:
         root_index_path = project_path / "index.html"
 
@@ -642,9 +863,11 @@ def render_route_configs(config: dict[str, Any]) -> str:
     rendered_routes = []
 
     for route in routes:
-        upstreams = route.get("upstreams") or [
+        normalized_route = normalize_route(route)
+
+        upstreams = normalized_route.get("upstreams") or [
             {
-                "address": route.get("upstream", "127.0.0.1:3000"),
+                "address": normalized_route.get("upstream", "127.0.0.1:3000"),
                 "weight": 1,
             }
         ]
@@ -652,8 +875,14 @@ def render_route_configs(config: dict[str, Any]) -> str:
         rendered_upstreams = []
 
         for upstream in upstreams:
-            address = upstream["address"]
-            weight = int(upstream.get("weight", 1))
+            if not isinstance(upstream, dict):
+                upstream = normalize_upstream_item(upstream)
+
+            address = normalize_upstream_address(upstream.get("address"))
+            weight = int(upstream.get("weight", 1) or 1)
+
+            if weight < 1:
+                weight = 1
 
             rendered_upstreams.append(
                 f"""UpstreamConfig {{
@@ -666,8 +895,8 @@ def render_route_configs(config: dict[str, Any]) -> str:
 
         rendered_routes.append(
             f"""RouteConfig {{
-        path: {rust_string(route["path"])}.to_string(),
-        balancing: {rust_string(route.get("balancing", "round_robin"))}.to_string(),
+        path: {rust_string(normalized_route["path"])}.to_string(),
+        balancing: {rust_string(normalized_route.get("balancing", "round_robin"))}.to_string(),
         upstreams: vec![
         {upstreams_rs}
         ],
@@ -718,7 +947,7 @@ use pingora::prelude::*;
 use std::collections::HashMap;
 use std::sync::atomic::{{AtomicUsize, Ordering}};
 use std::sync::{{Arc, Mutex}};
-use std::time::{{Duration, Instant}};
+use std::time::{{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 #[derive(Clone, Debug)]
 struct UpstreamConfig {{
@@ -756,6 +985,7 @@ struct RequestContext {{}}
 struct GeneratedProxy {{
     routes: Arc<Vec<RouteConfig>>,
     counters: Arc<Vec<AtomicUsize>>,
+    upstream_loads: Arc<Vec<Vec<AtomicUsize>>>,
     security: SecurityConfig,
     rate_limiter: Arc<Mutex<HashMap<String, RateBucket>>>,
 }}
@@ -767,9 +997,21 @@ impl GeneratedProxy {{
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>();
 
+        let upstream_loads = routes
+            .iter()
+            .map(|route| {{
+                route
+                    .upstreams
+                    .iter()
+                    .map(|_| AtomicUsize::new(0))
+                    .collect::<Vec<_>>()
+            }})
+            .collect::<Vec<_>>();
+
         Self {{
             routes: Arc::new(routes),
             counters: Arc::new(counters),
+            upstream_loads: Arc::new(upstream_loads),
             security,
             rate_limiter: Arc::new(Mutex::new(HashMap::new())),
         }}
@@ -800,17 +1042,113 @@ impl GeneratedProxy {{
         best_match.map(|(index, _)| index)
     }}
 
-    fn select_upstream(&self, route_index: usize) -> Option<String> {{
+    fn select_upstream(&self, route_index: usize, session: &Session) -> Option<String> {{
         let route = self.routes.get(route_index)?;
 
         if route.upstreams.is_empty() {{
             return None;
         }}
 
-        let counter = self.counters[route_index].fetch_add(1, Ordering::Relaxed);
-        let selected = counter % route.upstreams.len();
+        let len = route.upstreams.len();
+
+        let selected = match route.balancing.as_str() {{
+            "random" => self.select_random_index(route_index, len),
+            "weighted_round_robin" => self.select_weighted_round_robin_index(route_index, route),
+            "least_connections" => self.select_least_connections_index(route_index, len),
+            "ip_hash" => self.select_ip_hash_index(session, len),
+            _ => self.select_round_robin_index(route_index, len),
+        }};
 
         Some(route.upstreams[selected].address.clone())
+    }}
+
+    fn select_round_robin_index(&self, route_index: usize, len: usize) -> usize {{
+        let counter = self.counters[route_index].fetch_add(1, Ordering::Relaxed);
+        counter % len
+    }}
+
+    fn select_random_index(&self, route_index: usize, len: usize) -> usize {{
+        let counter = self.counters[route_index].fetch_add(1, Ordering::Relaxed);
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .subsec_nanos() as usize;
+
+        let mixed = counter
+            .wrapping_mul(1_103_515_245usize)
+            .wrapping_add(12_345usize)
+            .wrapping_add(nanos)
+            .wrapping_add(route_index.wrapping_mul(2_654_435_761usize));
+
+        mixed % len
+    }}
+
+    fn select_weighted_round_robin_index(&self, route_index: usize, route: &RouteConfig) -> usize {{
+        let total_weight: usize = route
+            .upstreams
+            .iter()
+            .map(|upstream| upstream.weight.max(1))
+            .sum();
+
+        if total_weight == 0 {{
+            return self.select_round_robin_index(route_index, route.upstreams.len());
+        }}
+
+        let counter = self.counters[route_index].fetch_add(1, Ordering::Relaxed);
+        let mut ticket = counter % total_weight;
+
+        for (index, upstream) in route.upstreams.iter().enumerate() {{
+            let weight = upstream.weight.max(1);
+
+            if ticket < weight {{
+                return index;
+            }}
+
+            ticket -= weight;
+        }}
+
+        0
+    }}
+
+    fn select_least_connections_index(&self, route_index: usize, len: usize) -> usize {{
+        let loads = match self.upstream_loads.get(route_index) {{
+            Some(value) => value,
+            None => return self.select_round_robin_index(route_index, len),
+        }};
+
+        let mut best_index = 0usize;
+        let mut best_load = usize::MAX;
+
+        for index in 0..len {{
+            let load = loads
+                .get(index)
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .unwrap_or(usize::MAX);
+
+            if load < best_load {{
+                best_load = load;
+                best_index = index;
+            }}
+        }}
+
+        if let Some(counter) = loads.get(best_index) {{
+            counter.fetch_add(1, Ordering::Relaxed);
+        }}
+
+        best_index
+    }}
+
+    fn select_ip_hash_index(&self, session: &Session, len: usize) -> usize {{
+        let key = client_key(session);
+        let mut hash: usize = 2_166_136_261usize;
+
+        for byte in key.as_bytes() {{
+            hash ^= *byte as usize;
+            hash = hash.wrapping_mul(16_777_619usize);
+        }}
+
+        hash % len
     }}
 
     fn is_blocked_path(&self, path: &str) -> bool {{
@@ -886,7 +1224,21 @@ fn parse_upstream(upstream: &str) -> (String, u16) {{
 
 fn client_key(session: &Session) -> String {{
     match session.client_addr() {{
-        Some(addr) => format!("{{:?}}", addr),
+        Some(addr) => {{
+            let raw = format!("{{:?}}", addr);
+
+            if raw.starts_with('[') {{
+                match raw.rfind("]:") {{
+                    Some(index) => raw[..index + 1].to_string(),
+                    None => raw,
+                }}
+            }} else {{
+                match raw.rfind(':') {{
+                    Some(index) => raw[..index].to_string(),
+                    None => raw,
+                }}
+            }}
+        }}
         None => "unknown".to_string(),
     }}
 }}
@@ -958,7 +1310,7 @@ impl ProxyHttp for GeneratedProxy {{
         let route_index = self.match_route_index(path).unwrap_or(0);
 
         let upstream = self
-            .select_upstream(route_index)
+            .select_upstream(route_index, session)
             .unwrap_or_else(|| "127.0.0.1:3000".to_string());
 
         let (host, port) = parse_upstream(upstream.as_str());
@@ -1018,6 +1370,11 @@ def write_project(
 
     cargo_toml = render_cargo_toml()
     main_rs = render_main_rs(normalized_config)
+
+    assert_rendered_rust_contains_upstreams(
+        config=normalized_config,
+        main_rs=main_rs,
+    )
 
     (project_path / "Cargo.toml").write_text(cargo_toml, encoding="utf-8")
     (src_dir / "main.rs").write_text(main_rs, encoding="utf-8")
