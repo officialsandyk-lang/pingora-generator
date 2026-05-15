@@ -35,6 +35,201 @@ VALID_BALANCING_ALGORITHMS = {
 }
 
 
+# ---------------------------------------------------------------------
+# Static webserver intent
+# ---------------------------------------------------------------------
+
+
+def _prompt_wants_static_webserver(prompt: str | None) -> bool:
+    text = str(prompt or "").lower()
+
+    return any(
+        marker in text
+        for marker in [
+            "webserver",
+            "web server",
+            "static site",
+            "static website",
+            "serve static",
+            "serve files",
+            "serve public",
+            "serving public",
+            "file server",
+            "static web",
+        ]
+    )
+
+
+def _prompt_explicitly_proxies_root(prompt: str | None) -> bool:
+    """
+    Do not convert "/" to static if the user clearly wants "/" proxied/LB'd.
+    """
+
+    text = str(prompt or "").lower()
+
+    patterns = [
+        r"/\s+to\s+backend",
+        r"/\s+to\s+upstream",
+        r"/\s+proxy\s+to",
+        r"/\s+proxied\s+to",
+        r"/\s+balanced\s+across",
+        r"/\s+load[- ]?balanced",
+        r"/\s+using\s+(?:round\s+robin|weighted\s+round\s+robin|random|ip\s+hash|least\s+connections?)",
+    ]
+
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _static_root_from_prompt(prompt: str | None) -> str:
+    text = str(prompt or "")
+
+    patterns = [
+        r"(?:serving|serve)\s+(?P<root>[A-Za-z0-9_./-]+)\s+at\s+/",
+        r"(?:from|root)\s+(?P<root>[A-Za-z0-9_./-]+)",
+        r"static\s+files\s+from\s+(?P<root>[A-Za-z0-9_./-]+)",
+        r"public\s+folder\s+(?P<root>[A-Za-z0-9_./-]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+
+        if match:
+            root = match.group("root").strip().strip("\"'")
+
+            if root:
+                return root
+
+    return "public"
+
+
+def _is_static_route(route: Dict[str, Any]) -> bool:
+    route_type = str(
+        route.get("type")
+        or route.get("kind")
+        or route.get("mode")
+        or ""
+    ).strip().lower()
+
+    return route_type in {
+        "static",
+        "web",
+        "webserver",
+        "web_server",
+        "file_server",
+        "files",
+    }
+
+
+def _normalize_static_route(route: Dict[str, Any]) -> Dict[str, Any]:
+    path = normalize_path(
+        route.get("path")
+        or route.get("prefix")
+        or route.get("route")
+        or "/"
+    )
+
+    fixed = copy.deepcopy(route)
+    fixed["path"] = path
+    fixed["type"] = "static"
+    fixed["root"] = str(
+        route.get("root")
+        or route.get("dir")
+        or route.get("directory")
+        or "public"
+    )
+    fixed["index"] = str(route.get("index") or "index.html")
+
+    fixed.pop("upstream", None)
+    fixed.pop("backend", None)
+    fixed.pop("upstreams", None)
+    fixed.pop("backends", None)
+    fixed.pop("backend_upstreams", None)
+    fixed.pop("balancing", None)
+    fixed.pop("algorithm", None)
+    fixed.pop("lb_algorithm", None)
+    fixed.pop("load_balancing", None)
+    fixed.pop("strategy", None)
+    fixed.pop("target", None)
+    fixed.pop("url", None)
+
+    return fixed
+
+
+def _ensure_static_webserver_route(
+    config: Dict[str, Any],
+    prompt: str | None,
+) -> Dict[str, Any]:
+    """
+    If the user asks for a webserver/static server, create a root static route.
+
+    Does not override explicit:
+      / to backend 127.0.0.1:9000
+      / balanced across ...
+    """
+
+    if not _prompt_wants_static_webserver(prompt):
+        return config
+
+    if _prompt_explicitly_proxies_root(prompt):
+        return config
+
+    repaired = copy.deepcopy(config)
+
+    routes = repaired.get("routes")
+
+    if not isinstance(routes, list):
+        repaired["routes"] = []
+        routes = repaired["routes"]
+
+    root = _static_root_from_prompt(prompt)
+
+    root_route = None
+
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+
+        route_path = normalize_path(
+            route.get("path")
+            or route.get("prefix")
+            or route.get("route")
+            or "/"
+        )
+
+        if route_path == "/":
+            root_route = route
+            break
+
+    if root_route is None:
+        root_route = {}
+        routes.insert(0, root_route)
+
+    root_route["path"] = "/"
+    root_route["type"] = "static"
+    root_route["root"] = root
+    root_route["index"] = "index.html"
+
+    root_route.pop("upstream", None)
+    root_route.pop("backend", None)
+    root_route.pop("upstreams", None)
+    root_route.pop("backends", None)
+    root_route.pop("backend_upstreams", None)
+    root_route.pop("balancing", None)
+    root_route.pop("algorithm", None)
+    root_route.pop("lb_algorithm", None)
+    root_route.pop("load_balancing", None)
+    root_route.pop("strategy", None)
+    root_route.pop("target", None)
+    root_route.pop("url", None)
+
+    return repaired
+
+
+# ---------------------------------------------------------------------
+# General helpers
+# ---------------------------------------------------------------------
+
+
 def _dedupe_strings(values: Iterable[str]) -> List[str]:
     output: List[str] = []
     seen: set[str] = set()
@@ -214,14 +409,6 @@ def _extract_weighted_backend_items(text: str) -> list[dict[str, Any]]:
       127.0.0.1:9101 weight 5,
       127.0.0.1:9102 weight 2,
       127.0.0.1:9103 weight 1
-
-    into:
-
-      [
-        {"address": "127.0.0.1:9101", "weight": 5},
-        {"address": "127.0.0.1:9102", "weight": 2},
-        {"address": "127.0.0.1:9103", "weight": 1}
-      ]
     """
 
     items: list[dict[str, Any]] = []
@@ -260,6 +447,9 @@ def _extract_weighted_backend_items(text: str) -> list[dict[str, Any]]:
 
 
 def _extract_route_field_upstreams(route: Dict[str, Any]) -> List[dict[str, Any]]:
+    if _is_static_route(route):
+        return []
+
     raw_items: list[Any] = []
 
     for key in ("upstreams", "backends", "backend_upstreams"):
@@ -326,6 +516,9 @@ def _route_declares_weights(upstreams: list[dict[str, Any]]) -> bool:
 
 
 def _normalize_route(route: Dict[str, Any]) -> Dict[str, Any]:
+    if _is_static_route(route):
+        return _normalize_static_route(route)
+
     path = normalize_path(
         route.get("path")
         or route.get("prefix")
@@ -429,6 +622,14 @@ def _merge_duplicate_routes(config: Dict[str, Any]) -> Dict[str, Any]:
             upstreams_by_path[path] = []
             ordered_paths.append(path)
 
+        if normalized.get("type") == "static":
+            route_by_path[path] = normalized
+            upstreams_by_path[path] = []
+            continue
+
+        if route_by_path[path].get("type") == "static":
+            continue
+
         current_algorithm = _route_algorithm(normalized)
 
         if current_algorithm:
@@ -458,6 +659,11 @@ def _merge_duplicate_routes(config: Dict[str, Any]) -> Dict[str, Any]:
 
     for path in ordered_paths:
         route = copy.deepcopy(route_by_path[path])
+
+        if route.get("type") == "static":
+            merged_routes.append(route)
+            continue
+
         upstreams = upstreams_by_path[path]
 
         if not upstreams:
@@ -502,14 +708,19 @@ def _merge_duplicate_routes(config: Dict[str, Any]) -> Dict[str, Any]:
     return repaired
 
 
+# ---------------------------------------------------------------------
+# Prompt load-balancer intent
+# ---------------------------------------------------------------------
+
+
 def _balanced_clause_stop_pattern() -> str:
     return (
         r"(?="
         r"\s*,\s*(?:and\s+)?/[A-Za-z0-9_.\-/]+\s+"
-        r"(?:balanced|load[- ]?balanced|balance|to\s+backend|to\s+backends|backend|using)"
+        r"(?:balanced|load[- ]?balanced|load\s+balance|balance|to\s+backend|to\s+backends|backend|using)"
         r"|"
         r"\s+and\s+/[A-Za-z0-9_.\-/]+\s+"
-        r"(?:balanced|load[- ]?balanced|balance|to\s+backend|to\s+backends|backend|using)"
+        r"(?:balanced|load[- ]?balanced|load\s+balance|balance|to\s+backend|to\s+backends|backend|using)"
         r"|"
         r"\.\s*"
         r"|"
@@ -536,32 +747,38 @@ def _parse_balanced_routes_from_prompt(
     stop = _balanced_clause_stop_pattern()
 
     patterns = [
-        # "/ balanced across backends 9101, 9102, and 9103 using random"
+        # "/api balanced across backends 9101, 9102, 9103 using random"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"(?:balanced|load[- ]?balanced|balance)\s+"
-        rf"(?:across|between|over)\s+backends?\s+"
+        rf"(?:across|between|over)\s+(?:backends?\s+)?"
         rf"(?P<backends>.*?){stop}",
 
-        # "balance / across backends 9101, 9102, and 9103"
+        # "balance /api across 9101, 9102, 9103 using random"
         rf"(?:balance|load[- ]?balance)\s+"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
-        rf"(?:across|between|over)\s+backends?\s+"
+        rf"(?:across|between|over)\s+(?:backends?\s+)?"
         rf"(?P<backends>.*?){stop}",
 
-        # "set / backends to 9101, 9102, and 9103"
+        # "load balance /api across 9101, 9102, 9103 using random"
+        rf"(?:load\s+balance|load[- ]?balance)\s+"
+        rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
+        rf"(?:across|between|over)\s+(?:backends?\s+)?"
+        rf"(?P<backends>.*?){stop}",
+
+        # "set /api backends to 9101, 9102, 9103"
         rf"set\s+"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"backends?\s+to\s+"
         rf"(?P<backends>.*?){stop}",
 
-        # "/ using weighted round robin across 9101 weight 5, 9102 weight 2"
+        # "/api using random across 9101, 9102, 9103"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"using\s+"
         rf"(?P<algorithm>weighted\s+round\s+robin|round\s+robin|least\s+connections?|ip\s+hash|random|sticky)\s+"
         rf"(?:across|between|over)\s+(?:backends?\s+)?"
         rf"(?P<backends>.*?){stop}",
 
-        # "with / using weighted round robin across ..."
+        # "with /api using random across 9101, 9102, 9103"
         rf"with\s+"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"using\s+"
@@ -654,6 +871,9 @@ def _set_route_upstreams(
     target_route["upstreams"] = route_upstreams
     target_route["balancing"] = algorithm
 
+    target_route.pop("type", None)
+    target_route.pop("root", None)
+    target_route.pop("index", None)
     target_route.pop("algorithm", None)
     target_route.pop("lb_algorithm", None)
     target_route.pop("load_balancing", None)
@@ -718,6 +938,9 @@ def _force_route_algorithm(
         if not isinstance(route, dict):
             continue
 
+        if _is_static_route(route):
+            continue
+
         route_path = normalize_path(
             route.get("path")
             or route.get("prefix")
@@ -778,10 +1001,7 @@ def repair_config(
 ) -> Dict[str, Any]:
     repaired = _ensure_config_shape(config)
 
-    repaired = _merge_duplicate_routes(repaired)
-    repaired = _restore_prompt_algorithms_after_merge(repaired, prompt)
-
-    repaired = _apply_prompt_load_balancer_intent(repaired, prompt)
+    repaired = _ensure_static_webserver_route(repaired, prompt)
 
     repaired = _merge_duplicate_routes(repaired)
     repaired = _restore_prompt_algorithms_after_merge(repaired, prompt)
@@ -790,5 +1010,12 @@ def repair_config(
 
     repaired = _merge_duplicate_routes(repaired)
     repaired = _restore_prompt_algorithms_after_merge(repaired, prompt)
+
+    repaired = _apply_prompt_load_balancer_intent(repaired, prompt)
+
+    repaired = _merge_duplicate_routes(repaired)
+    repaired = _restore_prompt_algorithms_after_merge(repaired, prompt)
+
+    repaired = _ensure_static_webserver_route(repaired, prompt)
 
     return repaired

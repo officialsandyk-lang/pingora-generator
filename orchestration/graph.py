@@ -132,22 +132,6 @@ def extract_upstream_addresses_from_text(text: str) -> list[str]:
 
 
 def extract_weighted_upstreams_from_text(text: str) -> list[dict[str, Any]]:
-    """
-    Parses:
-
-      127.0.0.1:9101 weight 5,
-      127.0.0.1:9102 weight 2,
-      127.0.0.1:9103 weight 1
-
-    into:
-
-      [
-        {"address": "127.0.0.1:9101", "weight": 5},
-        {"address": "127.0.0.1:9102", "weight": 2},
-        {"address": "127.0.0.1:9103", "weight": 1}
-      ]
-    """
-
     items: list[dict[str, Any]] = []
 
     pattern = re.compile(
@@ -192,8 +176,9 @@ def infer_balanced_path_from_text(text: str) -> str | None:
     segment = str(text or "").strip()
 
     patterns = [
-        r"(?:with|route|path|for)\s+(/[a-zA-Z0-9/_\-.]*)\s+(?:balanced|load\s+balanced|using|across)",
-        r"(^|\s)(/[a-zA-Z0-9/_\-.]*)\s+(?:balanced|load\s+balanced|using)\b",
+        r"(?:load\s+balance|load[- ]?balance|balance)\s+(/[a-zA-Z0-9/_\-.]*)\s+(?:across|between|over)",
+        r"(?:with|route|path|for)\s+(/[a-zA-Z0-9/_\-.]*)\s+(?:balanced|load\s+balanced|load\s+balance|using|across)",
+        r"(^|\s)(/[a-zA-Z0-9/_\-.]*)\s+(?:balanced|load\s+balanced|load\s+balance|using)\b",
     ]
 
     for pattern in patterns:
@@ -232,7 +217,13 @@ def _segment_has_load_balancer_intent(segment: str) -> bool:
     lowered = segment.lower()
     normalized = lowered.replace("-", " ").replace("_", " ")
 
-    if "balanced" in normalized or "load balanced" in normalized:
+    if "load balance" in normalized:
+        return True
+
+    if "load balanced" in normalized:
+        return True
+
+    if "balanced" in normalized:
         return True
 
     if "using weighted round robin" in normalized:
@@ -262,13 +253,9 @@ def apply_prompt_route_hints(
     or strip weighted upstream objects.
 
     Supports:
-
-      / balanced across backends 9101, 9102, 9103 using random
-
-      / using weighted round robin across
-      127.0.0.1:9101 weight 5,
-      127.0.0.1:9102 weight 2,
-      127.0.0.1:9103 weight 1
+      /api balanced across backends 9101, 9102, 9103 using random
+      load balance /api across 9101, 9102, 9103 using random
+      / using weighted round robin across 9101 weight 5, 9102 weight 2
     """
 
     fixed = copy.deepcopy(config)
@@ -346,6 +333,9 @@ def apply_prompt_route_hints(
         existing_route["upstreams"] = upstreams_value
         existing_route["balancing"] = balancing
 
+        existing_route.pop("type", None)
+        existing_route.pop("root", None)
+        existing_route.pop("index", None)
         existing_route.pop("algorithm", None)
         existing_route.pop("lb_algorithm", None)
         existing_route.pop("load_balancing", None)
@@ -361,12 +351,6 @@ def apply_prompt_balancing_hint(
     config: dict[str, Any],
     prompt: str | None,
 ) -> dict[str, Any]:
-    """
-    Locks requested algorithm after repair/validation/writer steps.
-
-    For weighted_round_robin this must not convert upstream dicts into strings.
-    """
-
     prompt_balancing = infer_balancing_from_prompt(prompt)
 
     if not prompt_balancing:
@@ -376,6 +360,9 @@ def apply_prompt_balancing_hint(
 
     for route in fixed.get("routes", []) or []:
         if not isinstance(route, dict):
+            continue
+
+        if route.get("type") == "static":
             continue
 
         upstreams = route.get("upstreams")
@@ -548,6 +535,9 @@ def apply_runtime_addressing(
 
     for route in _route_items(fixed):
         if not isinstance(route, dict):
+            continue
+
+        if route.get("type") == "static":
             continue
 
         path = str(

@@ -88,15 +88,54 @@ def normalize_upstream_address(value: Any) -> str:
     return f"{host}:{port}"
 
 
+def is_static_route(route: dict[str, Any]) -> bool:
+    route_type = str(
+        route.get("type")
+        or route.get("kind")
+        or route.get("mode")
+        or ""
+    ).strip().lower()
+
+    return route_type in {
+        "static",
+        "web",
+        "webserver",
+        "web_server",
+        "file_server",
+        "files",
+    }
+
+
+def normalize_static_route(route: dict[str, Any], path: str) -> dict[str, Any]:
+    normalized = copy.deepcopy(route)
+
+    normalized["path"] = path
+    normalized["type"] = "static"
+    normalized["root"] = str(
+        route.get("root")
+        or route.get("dir")
+        or route.get("directory")
+        or "public"
+    )
+    normalized["index"] = str(route.get("index") or "index.html")
+
+    normalized.pop("upstream", None)
+    normalized.pop("backend", None)
+    normalized.pop("upstreams", None)
+    normalized.pop("backends", None)
+    normalized.pop("backend_upstreams", None)
+    normalized.pop("balancing", None)
+    normalized.pop("algorithm", None)
+    normalized.pop("lb_algorithm", None)
+    normalized.pop("load_balancing", None)
+    normalized.pop("strategy", None)
+    normalized.pop("target", None)
+    normalized.pop("url", None)
+
+    return normalized
+
+
 def split_upstream_values(value: Any) -> list[Any]:
-    """
-    Handles bad intermediate forms like:
-
-        "127.0.0.1:9101,127.0.0.1:9102,127.0.0.1:9103"
-
-    and converts them back into separate upstream entries.
-    """
-
     if value is None:
         return []
 
@@ -122,15 +161,6 @@ def split_upstream_values(value: Any) -> list[Any]:
 
 
 def normalize_upstream_item(item: Any) -> dict[str, Any]:
-    """
-    Internal canonical upstream format:
-
-        {
-          "address": "127.0.0.1:9101",
-          "weight": 1
-        }
-    """
-
     if isinstance(item, dict):
         address = (
             item.get("address")
@@ -161,17 +191,8 @@ def normalize_upstream_item(item: Any) -> dict[str, Any]:
 
 
 def extract_route_upstreams(route: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    Extracts upstreams from many accepted input shapes.
-
-    Supports:
-      "upstream": "127.0.0.1:9101"
-      "upstream": "127.0.0.1:9101,127.0.0.1:9102"
-      "upstreams": ["127.0.0.1:9101", "127.0.0.1:9102"]
-      "upstreams": [{"address": "127.0.0.1:9101", "weight": 5}]
-      "backends": [...]
-      "backend_upstreams": [...]
-    """
+    if is_static_route(route):
+        return []
 
     raw_items: list[Any] = []
 
@@ -209,6 +230,14 @@ def extract_route_upstreams(route: dict[str, Any]) -> list[dict[str, Any]]:
         if address not in seen:
             upstreams.append(upstream)
             seen.add(address)
+        else:
+            for existing in upstreams:
+                if existing["address"] == address:
+                    existing["weight"] = max(
+                        int(existing.get("weight", 1)),
+                        int(upstream.get("weight", 1)),
+                    )
+                    break
 
     if not upstreams:
         upstreams.append(
@@ -222,6 +251,9 @@ def extract_route_upstreams(route: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def upstream_addresses(route: dict[str, Any]) -> list[str]:
+    if is_static_route(route):
+        return []
+
     addresses: list[str] = []
 
     for upstream in extract_route_upstreams(route):
@@ -283,19 +315,6 @@ def _format_upstreams_for_route(
     upstreams: list[dict[str, Any]],
     balancing: str | None,
 ) -> list[str] | list[dict[str, Any]]:
-    """
-    For normal algorithms, keep upstreams as list[str]:
-
-        ["127.0.0.1:9101", "127.0.0.1:9102"]
-
-    For weighted_round_robin, preserve weights:
-
-        [
-          {"address": "127.0.0.1:9101", "weight": 5},
-          {"address": "127.0.0.1:9102", "weight": 1}
-        ]
-    """
-
     if balancing == "weighted_round_robin":
         return [
             {
@@ -315,6 +334,9 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
         or route.get("route")
         or "/"
     )
+
+    if is_static_route(route):
+        return normalize_static_route(route, path)
 
     upstreams = extract_route_upstreams(route)
     addresses = [item["address"] for item in upstreams]
@@ -338,8 +360,6 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(route)
     normalized["path"] = path
     normalized["upstream"] = first_address
-
-    # Backward compatibility for older tests/agents.
     normalized["backend"] = first_address
 
     if len(addresses) > 1:
@@ -350,8 +370,6 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
         )
     else:
         normalized.pop("upstreams", None)
-
-        # A single backend does not need a balancing algorithm.
         normalized.pop("balancing", None)
 
     normalized.pop("algorithm", None)
@@ -367,19 +385,6 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
 
 
 def merge_duplicate_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Duplicate same-path routes with different upstreams become one route.
-
-    Example:
-
-      /users -> 9101
-      /users -> 9102
-
-    becomes:
-
-      /users -> upstreams [9101, 9102]
-    """
-
     ordered_paths: list[str] = []
     by_path: dict[str, dict[str, Any]] = {}
     upstreams_by_path: dict[str, list[dict[str, Any]]] = {}
@@ -395,6 +400,14 @@ def merge_duplicate_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]
             by_path[path] = normalized
             upstreams_by_path[path] = []
             ordered_paths.append(path)
+
+        if normalized.get("type") == "static":
+            by_path[path] = normalized
+            upstreams_by_path[path] = []
+            continue
+
+        if by_path[path].get("type") == "static":
+            continue
 
         for upstream in extract_route_upstreams(normalized):
             address = upstream["address"]
@@ -420,6 +433,11 @@ def merge_duplicate_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]
 
     for path in ordered_paths:
         route = copy.deepcopy(by_path[path])
+
+        if route.get("type") == "static":
+            output.append(route)
+            continue
+
         upstreams = upstreams_by_path[path]
 
         if not upstreams:
@@ -602,4 +620,5 @@ __all__ = [
     "upstream_addresses",
     "normalize_balancing",
     "VALID_BALANCING_ALGORITHMS",
+    "is_static_route",
 ]

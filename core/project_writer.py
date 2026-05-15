@@ -94,7 +94,6 @@ def normalize_upstream_address(value: Any) -> str:
     if host == "localhost":
         host = "127.0.0.1"
 
-    # Allow localhost-style addresses, Docker service names, and DNS-style names.
     if not re.fullmatch(r"[a-zA-Z0-9_.-]+", host):
         host = "127.0.0.1"
 
@@ -140,6 +139,59 @@ def normalize_balancing(value: Any) -> str:
     return normalized
 
 
+def is_static_route(route: dict[str, Any]) -> bool:
+    route_type = str(
+        route.get("type")
+        or route.get("kind")
+        or route.get("mode")
+        or ""
+    ).strip().lower()
+
+    return route_type in {
+        "static",
+        "web",
+        "webserver",
+        "web_server",
+        "file_server",
+        "files",
+    }
+
+
+def normalize_static_route(route: dict[str, Any]) -> dict[str, Any]:
+    path = normalize_path(
+        route.get("path")
+        or route.get("prefix")
+        or route.get("route")
+        or "/"
+    )
+
+    fixed = dict(route)
+    fixed["path"] = path
+    fixed["type"] = "static"
+    fixed["root"] = str(
+        route.get("root")
+        or route.get("dir")
+        or route.get("directory")
+        or "public"
+    )
+    fixed["index"] = str(route.get("index") or "index.html")
+    fixed["balancing"] = "round_robin"
+    fixed["upstreams"] = []
+
+    fixed.pop("upstream", None)
+    fixed.pop("backend", None)
+    fixed.pop("backends", None)
+    fixed.pop("backend_upstreams", None)
+    fixed.pop("algorithm", None)
+    fixed.pop("lb_algorithm", None)
+    fixed.pop("load_balancing", None)
+    fixed.pop("strategy", None)
+    fixed.pop("target", None)
+    fixed.pop("url", None)
+
+    return fixed
+
+
 def normalize_upstream_item(item: Any) -> dict[str, Any]:
     if isinstance(item, str):
         return {
@@ -177,6 +229,9 @@ def normalize_upstream_item(item: Any) -> dict[str, Any]:
 
 
 def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
+    if is_static_route(route):
+        return normalize_static_route(route)
+
     path = normalize_path(
         route.get("path")
         or route.get("prefix")
@@ -256,6 +311,9 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
 
 
 def route_upstream_addresses(route: dict[str, Any]) -> list[str]:
+    if is_static_route(route):
+        return []
+
     normalized = normalize_route(route)
     addresses: list[str] = []
 
@@ -273,7 +331,7 @@ def route_upstream_addresses(route: dict[str, Any]) -> list[str]:
         if address not in addresses:
             addresses.append(address)
 
-    if not addresses:
+    if not addresses and normalized.get("upstream"):
         addresses.append(normalize_upstream_address(normalized.get("upstream")))
 
     return addresses
@@ -295,6 +353,14 @@ def merge_routes_for_generation(routes: list[dict[str, Any]]) -> list[dict[str, 
             merged[path] = normalized
             upstreams_by_path[path] = []
             ordered_paths.append(path)
+
+        if normalized.get("type") == "static":
+            merged[path] = normalized
+            upstreams_by_path[path] = []
+            continue
+
+        if merged[path].get("type") == "static":
+            continue
 
         if normalized.get("balancing"):
             merged[path]["balancing"] = normalized["balancing"]
@@ -335,6 +401,11 @@ def merge_routes_for_generation(routes: list[dict[str, Any]]) -> list[dict[str, 
 
     for path in ordered_paths:
         route = dict(merged[path])
+
+        if route.get("type") == "static":
+            output.append(route)
+            continue
+
         upstreams = upstreams_by_path[path]
 
         if not upstreams:
@@ -475,10 +546,12 @@ def normalize_config_for_generation(config: dict[str, Any]) -> dict[str, Any]:
 
     if not normalized_routes:
         normalized_routes = [
-            normalize_route(
+            normalize_static_route(
                 {
                     "path": "/",
-                    "upstream": "127.0.0.1:3000",
+                    "type": "static",
+                    "root": "public",
+                    "index": "index.html",
                 }
             )
         ]
@@ -505,12 +578,15 @@ def get_route_upstream(route: dict[str, Any]) -> str:
     addresses = route_upstream_addresses(route)
 
     if not addresses:
-        return "127.0.0.1:3000"
+        return ""
 
     return addresses[0]
 
 
 def get_route_upstreams_display(route: dict[str, Any]) -> str:
+    if is_static_route(route):
+        return f"static:{route.get('root', 'public')}"
+
     addresses = route_upstream_addresses(route)
 
     if not addresses:
@@ -554,58 +630,13 @@ def render_demo_route_index_html(
   <meta charset="utf-8">
   <title>{safe_project} - {safe_route}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {{
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 40px;
-      line-height: 1.5;
-      color: #111827;
-      background: #f9fafb;
-    }}
-    main {{
-      max-width: 760px;
-      background: white;
-      border: 1px solid #e5e7eb;
-      border-radius: 16px;
-      padding: 28px;
-      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.06);
-    }}
-    code {{
-      background: #f3f4f6;
-      padding: 2px 6px;
-      border-radius: 6px;
-    }}
-    a {{
-      color: #2563eb;
-      font-weight: 700;
-      text-decoration: none;
-    }}
-    a:hover {{
-      text-decoration: underline;
-    }}
-    .ok {{
-      color: #047857;
-      font-weight: 700;
-    }}
-  </style>
 </head>
 <body>
   <main>
-    <h1 class="ok">✅ Route works: <code>{safe_route}</code></h1>
+    <h1>✅ Route works: <code>{safe_route}</code></h1>
     <p>This is demo backend content generated for local testing.</p>
-
-    <h2>Route</h2>
-    <p><code>{safe_route}</code></p>
-
-    <h2>Upstream(s)</h2>
-    <p><code>{safe_upstream}</code></p>
-
-    <h2>Proxy</h2>
-    <p><code>http://127.0.0.1:{port}{safe_route}</code></p>
-
-    <p><a href="/">← Back to route index</a></p>
-
-    <p>You can replace this file with your own backend/static content later.</p>
+    <p>Upstream(s): <code>{safe_upstream}</code></p>
+    <p>Proxy: <code>http://127.0.0.1:{port}{safe_route}</code></p>
   </main>
 </body>
 </html>
@@ -645,7 +676,7 @@ def render_demo_home_index_html(
             """
         )
 
-    links_html = "\n".join(links) if links else "<li>No routes generated yet.</li>"
+    links_html = "\n".join(links) if links else "<li>No extra routes generated yet.</li>"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -653,58 +684,13 @@ def render_demo_home_index_html(
   <meta charset="utf-8">
   <title>{safe_project}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <style>
-    body {{
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      margin: 40px;
-      line-height: 1.5;
-      color: #111827;
-      background: #f9fafb;
-    }}
-    main {{
-      max-width: 860px;
-      background: white;
-      border: 1px solid #e5e7eb;
-      border-radius: 16px;
-      padding: 28px;
-      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.06);
-    }}
-    code {{
-      background: #f3f4f6;
-      padding: 2px 6px;
-      border-radius: 6px;
-    }}
-    li {{
-      margin: 12px 0;
-    }}
-    a {{
-      font-weight: 700;
-      color: #2563eb;
-      text-decoration: none;
-    }}
-    a:hover {{
-      text-decoration: underline;
-    }}
-    .ok {{
-      color: #047857;
-      font-weight: 700;
-    }}
-    .muted {{
-      color: #6b7280;
-    }}
-  </style>
 </head>
 <body>
   <main>
-    <h1 class="ok">✅ AI Pingora Gateway is running</h1>
+    <h1>✅ AI Pingora Gateway is running</h1>
     <p>Live URL: <code>http://127.0.0.1:{port}</code></p>
-
     <h2>Available routes</h2>
-    <ul>
-      {links_html}
-    </ul>
-
-    <p class="muted">Click any route above to test the generated backend placeholder page.</p>
+    <ul>{links_html}</ul>
   </main>
 </body>
 </html>
@@ -731,6 +717,71 @@ def write_json_if_allowed(path: Path, data: dict[str, Any], *, overwrite: bool) 
         json.dump(data, f, indent=2)
 
     return True
+
+
+def write_default_public_files(project_path: Path, config: dict[str, Any]) -> None:
+    routes = config.get("routes") or []
+
+    if not any(isinstance(route, dict) and is_static_route(route) for route in routes):
+        return
+
+    for route in routes:
+        if not isinstance(route, dict) or not is_static_route(route):
+            continue
+
+        root = str(route.get("root") or "public")
+        index = str(route.get("index") or "index.html")
+
+        public_dir = project_path / root
+        public_dir.mkdir(parents=True, exist_ok=True)
+
+        index_path = public_dir / index
+
+        if index_path.exists():
+            continue
+
+        port = int(config.get("port") or 8090)
+
+        index_path.write_text(
+            f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>AI Pingora Webserver</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body {{
+      font-family: system-ui, sans-serif;
+      margin: 40px;
+      background: #f9fafb;
+      color: #111827;
+    }}
+    main {{
+      max-width: 800px;
+      background: white;
+      border: 1px solid #e5e7eb;
+      border-radius: 16px;
+      padding: 32px;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.06);
+    }}
+    code {{
+      background: #f3f4f6;
+      padding: 2px 6px;
+      border-radius: 6px;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>✅ AI Pingora Webserver is running</h1>
+    <p>This page is served directly by the generated Pingora webserver.</p>
+    <p>Live URL: <code>http://127.0.0.1:{port}/</code></p>
+  </main>
+</body>
+</html>
+""",
+            encoding="utf-8",
+        )
 
 
 def write_demo_backend_files(
@@ -761,14 +812,11 @@ def write_demo_backend_files(
     if not isinstance(routes, list):
         return result
 
-    has_root_route = any(
-        isinstance(route, dict)
-        and normalize_path(route.get("path") or route.get("prefix") or route.get("route")) == "/"
-        for route in routes
-    )
-
     for route in routes:
         if not isinstance(route, dict):
+            continue
+
+        if is_static_route(route):
             continue
 
         route_path = normalize_path(route.get("path") or route.get("prefix") or route.get("route"))
@@ -823,26 +871,6 @@ def write_demo_backend_files(
                 }
             )
 
-    if has_root_route:
-        root_index_path = project_path / "index.html"
-
-        root_html = render_demo_home_index_html(
-            config=config,
-            port=port,
-        )
-
-        wrote_root = write_text_if_allowed(root_index_path, root_html, overwrite=overwrite)
-
-        if wrote_root:
-            result["created"].append(
-                {
-                    "route": "/",
-                    "dir": str(project_path),
-                    "index": str(root_index_path),
-                    "metadata": str(project_path / "route.json"),
-                }
-            )
-
     return result
 
 
@@ -854,6 +882,7 @@ edition = "2021"
 
 [dependencies]
 async-trait = "0.1"
+bytes = "1"
 pingora = { version = "0.8.0", features = ["proxy"] }
 """
 
@@ -865,12 +894,11 @@ def render_route_configs(config: dict[str, Any]) -> str:
     for route in routes:
         normalized_route = normalize_route(route)
 
-        upstreams = normalized_route.get("upstreams") or [
-            {
-                "address": normalized_route.get("upstream", "127.0.0.1:3000"),
-                "weight": 1,
-            }
-        ]
+        route_type = str(normalized_route.get("type") or "proxy").lower()
+        root = str(normalized_route.get("root") or "public")
+        index = str(normalized_route.get("index") or "index.html")
+
+        upstreams = normalized_route.get("upstreams") or []
 
         rendered_upstreams = []
 
@@ -896,6 +924,9 @@ def render_route_configs(config: dict[str, Any]) -> str:
         rendered_routes.append(
             f"""RouteConfig {{
         path: {rust_string(normalized_route["path"])}.to_string(),
+        route_type: {rust_string(route_type)}.to_string(),
+        root: {rust_string(root)}.to_string(),
+        index: {rust_string(index)}.to_string(),
         balancing: {rust_string(normalized_route.get("balancing", "round_robin"))}.to_string(),
         upstreams: vec![
         {upstreams_rs}
@@ -943,8 +974,11 @@ def render_main_rs(
     security_rs = render_security_config(config)
 
     return f"""use async_trait::async_trait;
+use bytes::Bytes;
+use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{{AtomicUsize, Ordering}};
 use std::sync::{{Arc, Mutex}};
 use std::time::{{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -958,6 +992,9 @@ struct UpstreamConfig {{
 #[derive(Clone, Debug)]
 struct RouteConfig {{
     path: String,
+    route_type: String,
+    root: String,
+    index: String,
     balancing: String,
     upstreams: Vec<UpstreamConfig>,
 }}
@@ -988,6 +1025,51 @@ struct GeneratedProxy {{
     upstream_loads: Arc<Vec<Vec<AtomicUsize>>>,
     security: SecurityConfig,
     rate_limiter: Arc<Mutex<HashMap<String, RateBucket>>>,
+}}
+
+fn content_type_for_path(path: &PathBuf) -> &'static str {{
+    match path.extension().and_then(|value| value.to_str()).unwrap_or("") {{
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "txt" => "text/plain; charset=utf-8",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }}
+}}
+
+fn safe_static_path(root: &str, relative_path: &str, index: &str) -> Option<PathBuf> {{
+    let mut path = PathBuf::from(root);
+
+    let clean_relative = relative_path.trim_start_matches('/');
+
+    if clean_relative.is_empty() {{
+        path.push(index);
+        return Some(path);
+    }}
+
+    for part in clean_relative.split('/') {{
+        if part.is_empty() {{
+            continue;
+        }}
+
+        if part == "." || part == ".." || part.contains('\\\\') {{
+            return None;
+        }}
+
+        path.push(part);
+    }}
+
+    if relative_path.ends_with('/') {{
+        path.push(index);
+    }}
+
+    Some(path)
 }}
 
 impl GeneratedProxy {{
@@ -1040,6 +1122,53 @@ impl GeneratedProxy {{
         }}
 
         best_match.map(|(index, _)| index)
+    }}
+
+    async fn serve_static_route(
+        &self,
+        session: &mut Session,
+        route: &RouteConfig,
+        request_path: &str,
+    ) -> Result<bool> {{
+        let relative_path = if route.path == "/" {{
+            request_path
+        }} else {{
+            request_path
+                .strip_prefix(route.path.trim_end_matches('/'))
+                .unwrap_or("")
+        }};
+
+        let file_path = match safe_static_path(&route.root, relative_path, &route.index) {{
+            Some(path) => path,
+            None => {{
+                session.respond_error(403).await?;
+                return Ok(true);
+            }}
+        }};
+
+        let body = match std::fs::read(&file_path) {{
+            Ok(value) => value,
+            Err(_) => {{
+                session.respond_error(404).await?;
+                return Ok(true);
+            }}
+        }};
+
+        let mut header = ResponseHeader::build(200, None)?;
+        header.insert_header("content-type", content_type_for_path(&file_path))?;
+        header.insert_header("content-length", body.len().to_string())?;
+
+        session.write_response_header(Box::new(header), false).await?;
+
+        if session.req_header().method.as_str().eq_ignore_ascii_case("HEAD") {{
+            session.write_response_body(None, true).await?;
+        }} else {{
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
+        }}
+
+        Ok(true)
     }}
 
     fn select_upstream(&self, route_index: usize, session: &Session) -> Option<String> {{
@@ -1292,9 +1421,24 @@ impl ProxyHttp for GeneratedProxy {{
             return Ok(true);
         }}
 
-        if self.match_route_index(&path).is_none() {{
-            session.respond_error(404).await?;
-            return Ok(true);
+        let route_index = match self.match_route_index(&path) {{
+            Some(index) => index,
+            None => {{
+                session.respond_error(404).await?;
+                return Ok(true);
+            }}
+        }};
+
+        let route = match self.routes.get(route_index) {{
+            Some(value) => value.clone(),
+            None => {{
+                session.respond_error(404).await?;
+                return Ok(true);
+            }}
+        }};
+
+        if route.route_type == "static" {{
+            return self.serve_static_route(session, &route, &path).await;
         }}
 
         Ok(false)
@@ -1367,6 +1511,8 @@ def write_project(
     src_dir.mkdir(parents=True, exist_ok=True)
 
     normalized_config = normalize_config_for_generation(config)
+
+    write_default_public_files(project_path, normalized_config)
 
     cargo_toml = render_cargo_toml()
     main_rs = render_main_rs(normalized_config)
