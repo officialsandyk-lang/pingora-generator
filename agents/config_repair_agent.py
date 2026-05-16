@@ -61,10 +61,6 @@ def _prompt_wants_static_webserver(prompt: str | None) -> bool:
 
 
 def _prompt_explicitly_proxies_root(prompt: str | None) -> bool:
-    """
-    Do not convert "/" to static if the user clearly wants "/" proxied/LB'd.
-    """
-
     text = str(prompt or "").lower()
 
     patterns = [
@@ -75,6 +71,7 @@ def _prompt_explicitly_proxies_root(prompt: str | None) -> bool:
         r"/\s+balanced\s+across",
         r"/\s+load[- ]?balanced",
         r"/\s+using\s+(?:round\s+robin|weighted\s+round\s+robin|random|ip\s+hash|least\s+connections?)",
+        r"(?:load\s+balance|load[- ]?balance|balance)\s+/\s+(?:across|between|over)",
     ]
 
     return any(re.search(pattern, text) for pattern in patterns)
@@ -139,18 +136,22 @@ def _normalize_static_route(route: Dict[str, Any]) -> Dict[str, Any]:
     )
     fixed["index"] = str(route.get("index") or "index.html")
 
-    fixed.pop("upstream", None)
-    fixed.pop("backend", None)
-    fixed.pop("upstreams", None)
-    fixed.pop("backends", None)
-    fixed.pop("backend_upstreams", None)
-    fixed.pop("balancing", None)
-    fixed.pop("algorithm", None)
-    fixed.pop("lb_algorithm", None)
-    fixed.pop("load_balancing", None)
-    fixed.pop("strategy", None)
-    fixed.pop("target", None)
-    fixed.pop("url", None)
+    for key in (
+        "upstream",
+        "backend",
+        "upstreams",
+        "backends",
+        "backend_upstreams",
+        "balancing",
+        "load_balance",
+        "algorithm",
+        "lb_algorithm",
+        "load_balancing",
+        "strategy",
+        "target",
+        "url",
+    ):
+        fixed.pop(key, None)
 
     return fixed
 
@@ -160,11 +161,8 @@ def _ensure_static_webserver_route(
     prompt: str | None,
 ) -> Dict[str, Any]:
     """
-    If the user asks for a webserver/static server, create a root static route.
-
-    Does not override explicit:
-      / to backend 127.0.0.1:9000
-      / balanced across ...
+    If user asks for a webserver/static server, create a root static route.
+    Do not override explicit proxy/LB intent for "/".
     """
 
     if not _prompt_wants_static_webserver(prompt):
@@ -182,7 +180,6 @@ def _ensure_static_webserver_route(
         routes = repaired["routes"]
 
     root = _static_root_from_prompt(prompt)
-
     root_route = None
 
     for route in routes:
@@ -209,18 +206,22 @@ def _ensure_static_webserver_route(
     root_route["root"] = root
     root_route["index"] = "index.html"
 
-    root_route.pop("upstream", None)
-    root_route.pop("backend", None)
-    root_route.pop("upstreams", None)
-    root_route.pop("backends", None)
-    root_route.pop("backend_upstreams", None)
-    root_route.pop("balancing", None)
-    root_route.pop("algorithm", None)
-    root_route.pop("lb_algorithm", None)
-    root_route.pop("load_balancing", None)
-    root_route.pop("strategy", None)
-    root_route.pop("target", None)
-    root_route.pop("url", None)
+    for key in (
+        "upstream",
+        "backend",
+        "upstreams",
+        "backends",
+        "backend_upstreams",
+        "balancing",
+        "load_balance",
+        "algorithm",
+        "lb_algorithm",
+        "load_balancing",
+        "strategy",
+        "target",
+        "url",
+    ):
+        root_route.pop(key, None)
 
     return repaired
 
@@ -313,8 +314,14 @@ def _infer_balancing_algorithm_from_text(text: str | None) -> str | None:
 
 
 def _route_algorithm(route: Dict[str, Any]) -> str | None:
+    """
+    Canonical priority:
+      load_balance wins because many LLMs emit it route-specifically.
+    """
+
     return _normalize_algorithm(
-        route.get("balancing")
+        route.get("load_balance")
+        or route.get("balancing")
         or route.get("algorithm")
         or route.get("lb_algorithm")
         or route.get("load_balancing")
@@ -403,14 +410,6 @@ def _extract_backend_list(text: str) -> List[str]:
 
 
 def _extract_weighted_backend_items(text: str) -> list[dict[str, Any]]:
-    """
-    Parses:
-
-      127.0.0.1:9101 weight 5,
-      127.0.0.1:9102 weight 2,
-      127.0.0.1:9103 weight 1
-    """
-
     items: list[dict[str, Any]] = []
 
     pattern = re.compile(
@@ -556,14 +555,18 @@ def _normalize_route(route: Dict[str, Any]) -> Dict[str, Any]:
         fixed.pop("upstreams", None)
         fixed.pop("balancing", None)
 
-    fixed.pop("algorithm", None)
-    fixed.pop("lb_algorithm", None)
-    fixed.pop("load_balancing", None)
-    fixed.pop("strategy", None)
-    fixed.pop("backends", None)
-    fixed.pop("backend_upstreams", None)
-    fixed.pop("target", None)
-    fixed.pop("url", None)
+    for key in (
+        "load_balance",
+        "algorithm",
+        "lb_algorithm",
+        "load_balancing",
+        "strategy",
+        "backends",
+        "backend_upstreams",
+        "target",
+        "url",
+    ):
+        fixed.pop(key, None)
 
     return fixed
 
@@ -693,14 +696,18 @@ def _merge_duplicate_routes(config: Dict[str, Any]) -> Dict[str, Any]:
             route.pop("upstreams", None)
             route.pop("balancing", None)
 
-        route.pop("algorithm", None)
-        route.pop("lb_algorithm", None)
-        route.pop("load_balancing", None)
-        route.pop("strategy", None)
-        route.pop("backends", None)
-        route.pop("backend_upstreams", None)
-        route.pop("target", None)
-        route.pop("url", None)
+        for key in (
+            "load_balance",
+            "algorithm",
+            "lb_algorithm",
+            "load_balancing",
+            "strategy",
+            "backends",
+            "backend_upstreams",
+            "target",
+            "url",
+        ):
+            route.pop(key, None)
 
         merged_routes.append(route)
 
@@ -709,13 +716,29 @@ def _merge_duplicate_routes(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------
-# Prompt load-balancer intent
+# Prompt route intent
 # ---------------------------------------------------------------------
+
+
+def _split_prompt_clauses(prompt: str | None) -> list[str]:
+    text = str(prompt or "")
+
+    clauses = [
+        item.strip()
+        for item in re.split(r"[;\n]+", text)
+        if item.strip()
+    ]
+
+    return clauses or [text]
 
 
 def _balanced_clause_stop_pattern() -> str:
     return (
         r"(?="
+        r"\s*;"
+        r"|"
+        r"\n"
+        r"|"
         r"\s*,\s*(?:and\s+)?/[A-Za-z0-9_.\-/]+\s+"
         r"(?:balanced|load[- ]?balanced|load\s+balance|balance|to\s+backend|to\s+backends|backend|using)"
         r"|"
@@ -747,38 +770,34 @@ def _parse_balanced_routes_from_prompt(
     stop = _balanced_clause_stop_pattern()
 
     patterns = [
-        # "/api balanced across backends 9101, 9102, 9103 using random"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"(?:balanced|load[- ]?balanced|balance)\s+"
         rf"(?:across|between|over)\s+(?:backends?\s+)?"
         rf"(?P<backends>.*?){stop}",
 
-        # "balance /api across 9101, 9102, 9103 using random"
-        rf"(?:balance|load[- ]?balance)\s+"
+        rf"(?:balance|load[- ]?balance|load\s+balance)\s+"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"(?:across|between|over)\s+(?:backends?\s+)?"
         rf"(?P<backends>.*?){stop}",
 
-        # "load balance /api across 9101, 9102, 9103 using random"
-        rf"(?:load\s+balance|load[- ]?balance)\s+"
-        rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
-        rf"(?:across|between|over)\s+(?:backends?\s+)?"
-        rf"(?P<backends>.*?){stop}",
-
-        # "set /api backends to 9101, 9102, 9103"
         rf"set\s+"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"backends?\s+to\s+"
         rf"(?P<backends>.*?){stop}",
 
-        # "/api using random across 9101, 9102, 9103"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"using\s+"
         rf"(?P<algorithm>weighted\s+round\s+robin|round\s+robin|least\s+connections?|ip\s+hash|random|sticky)\s+"
         rf"(?:across|between|over)\s+(?:backends?\s+)?"
         rf"(?P<backends>.*?){stop}",
 
-        # "with /api using random across 9101, 9102, 9103"
+        rf"(?:create|add|route|set)\s+"
+        rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
+        rf"using\s+"
+        rf"(?P<algorithm>weighted\s+round\s+robin|round\s+robin|least\s+connections?|ip\s+hash|random|sticky)\s+"
+        rf"(?:across|between|over)\s+(?:backends?\s+)?"
+        rf"(?P<backends>.*?){stop}",
+
         rf"with\s+"
         rf"(?P<path>/[A-Za-z0-9_.\-/]*)\s+"
         rf"using\s+"
@@ -787,28 +806,31 @@ def _parse_balanced_routes_from_prompt(
         rf"(?P<backends>.*?){stop}",
     ]
 
-    for pattern in patterns:
-        for match in re.finditer(pattern, prompt, flags=re.IGNORECASE | re.DOTALL):
-            path = normalize_path(match.group("path") or "/")
-            backend_text = match.group("backends")
+    for clause in _split_prompt_clauses(prompt):
+        clause_algorithm = _infer_balancing_algorithm_from_text(clause)
 
-            algorithm = (
-                _infer_balancing_algorithm_from_text(match.groupdict().get("algorithm"))
-                or _infer_balancing_algorithm_from_text(backend_text)
-                or _infer_balancing_algorithm_from_text(prompt)
-                or DEFAULT_BALANCING
-            )
+        for pattern in patterns:
+            for match in re.finditer(pattern, clause, flags=re.IGNORECASE | re.DOTALL):
+                path = normalize_path(match.group("path") or "/")
+                backend_text = match.group("backends")
 
-            if algorithm == "weighted_round_robin":
-                backends: List[Any] = _extract_weighted_backend_items(backend_text)
-            else:
-                backends = _extract_backend_list(backend_text)
+                algorithm = (
+                    _infer_balancing_algorithm_from_text(match.groupdict().get("algorithm"))
+                    or clause_algorithm
+                    or _infer_balancing_algorithm_from_text(backend_text)
+                    or DEFAULT_BALANCING
+                )
 
-            if len(backends) >= 2:
-                item = (path, backends, algorithm)
+                if algorithm == "weighted_round_robin":
+                    backends: List[Any] = _extract_weighted_backend_items(backend_text)
+                else:
+                    backends = _extract_backend_list(backend_text)
 
-                if item not in matches:
-                    matches.append(item)
+                if len(backends) >= 2:
+                    item = (path, backends, algorithm)
+
+                    if item not in matches:
+                        matches.append(item)
 
     return matches
 
@@ -871,17 +893,21 @@ def _set_route_upstreams(
     target_route["upstreams"] = route_upstreams
     target_route["balancing"] = algorithm
 
-    target_route.pop("type", None)
-    target_route.pop("root", None)
-    target_route.pop("index", None)
-    target_route.pop("algorithm", None)
-    target_route.pop("lb_algorithm", None)
-    target_route.pop("load_balancing", None)
-    target_route.pop("strategy", None)
-    target_route.pop("backends", None)
-    target_route.pop("backend_upstreams", None)
-    target_route.pop("target", None)
-    target_route.pop("url", None)
+    for key in (
+        "type",
+        "root",
+        "index",
+        "load_balance",
+        "algorithm",
+        "lb_algorithm",
+        "load_balancing",
+        "strategy",
+        "backends",
+        "backend_upstreams",
+        "target",
+        "url",
+    ):
+        target_route.pop(key, None)
 
     return repaired
 
@@ -950,6 +976,7 @@ def _force_route_algorithm(
 
         if route_path == target_path:
             route["balancing"] = algorithm
+            route.pop("load_balance", None)
 
     return repaired
 

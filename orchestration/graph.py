@@ -177,6 +177,7 @@ def infer_balanced_path_from_text(text: str) -> str | None:
 
     patterns = [
         r"(?:load\s+balance|load[- ]?balance|balance)\s+(/[a-zA-Z0-9/_\-.]*)\s+(?:across|between|over)",
+        r"(?:create|add|route|set)\s+(/[a-zA-Z0-9/_\-.]*)\s+using\s+(?:weighted\s+round\s+robin|round\s+robin|least\s+connections?|ip\s+hash|random|sticky)",
         r"(?:with|route|path|for)\s+(/[a-zA-Z0-9/_\-.]*)\s+(?:balanced|load\s+balanced|load\s+balance|using|across)",
         r"(^|\s)(/[a-zA-Z0-9/_\-.]*)\s+(?:balanced|load\s+balanced|load\s+balance|using)\b",
     ]
@@ -202,6 +203,7 @@ def infer_balanced_path_from_text(text: str) -> str | None:
 
 def split_prompt_into_route_segments(prompt: str | None) -> list[str]:
     text = str(prompt or "")
+
     parts = re.split(r"[;\n]+", text)
 
     clean_parts = [
@@ -244,20 +246,39 @@ def _segment_has_load_balancer_intent(segment: str) -> bool:
     return False
 
 
+def normalize_load_balance_aliases(config: dict[str, Any]) -> dict[str, Any]:
+    """
+    Converts route['load_balance'] into canonical route['balancing'].
+    load_balance wins because it is commonly route-specific LLM output.
+    """
+
+    fixed = copy.deepcopy(config)
+
+    for route in fixed.get("routes", []) or []:
+        if not isinstance(route, dict):
+            continue
+
+        if route.get("type") == "static":
+            route.pop("load_balance", None)
+            continue
+
+        alias = route.get("load_balance")
+
+        if alias:
+            algorithm = infer_balancing_from_prompt(str(alias))
+
+            if algorithm:
+                route["balancing"] = algorithm
+
+        route.pop("load_balance", None)
+
+    return fixed
+
+
 def apply_prompt_route_hints(
     config: dict[str, Any],
     prompt: str | None,
 ) -> dict[str, Any]:
-    """
-    Deterministic safety net when the LLM or agents drop multi-upstream routes
-    or strip weighted upstream objects.
-
-    Supports:
-      /api balanced across backends 9101, 9102, 9103 using random
-      load balance /api across 9101, 9102, 9103 using random
-      / using weighted round robin across 9101 weight 5, 9102 weight 2
-    """
-
     fixed = copy.deepcopy(config)
 
     routes = fixed.get("routes")
@@ -284,7 +305,6 @@ def apply_prompt_route_hints(
 
         balancing = (
             infer_balancing_from_prompt(segment)
-            or infer_balancing_from_prompt(prompt)
             or "round_robin"
         )
 
@@ -333,16 +353,20 @@ def apply_prompt_route_hints(
         existing_route["upstreams"] = upstreams_value
         existing_route["balancing"] = balancing
 
-        existing_route.pop("type", None)
-        existing_route.pop("root", None)
-        existing_route.pop("index", None)
-        existing_route.pop("algorithm", None)
-        existing_route.pop("lb_algorithm", None)
-        existing_route.pop("load_balancing", None)
-        existing_route.pop("backends", None)
-        existing_route.pop("backend_upstreams", None)
-        existing_route.pop("target", None)
-        existing_route.pop("url", None)
+        for key in (
+            "type",
+            "root",
+            "index",
+            "load_balance",
+            "algorithm",
+            "lb_algorithm",
+            "load_balancing",
+            "backends",
+            "backend_upstreams",
+            "target",
+            "url",
+        ):
+            existing_route.pop(key, None)
 
     return fixed
 
@@ -351,33 +375,53 @@ def apply_prompt_balancing_hint(
     config: dict[str, Any],
     prompt: str | None,
 ) -> dict[str, Any]:
-    prompt_balancing = infer_balancing_from_prompt(prompt)
-
-    if not prompt_balancing:
-        return config
+    """
+    Route-specific algorithm lock.
+    Prevents /orders weighted_round_robin from leaking to /api or /users.
+    """
 
     fixed = copy.deepcopy(config)
 
-    for route in fixed.get("routes", []) or []:
-        if not isinstance(route, dict):
+    segments = split_prompt_into_route_segments(prompt)
+
+    for segment in segments:
+        path = infer_balanced_path_from_text(segment)
+        algorithm = infer_balancing_from_prompt(segment)
+
+        if not path or not algorithm:
             continue
 
-        if route.get("type") == "static":
-            continue
+        for route in fixed.get("routes", []) or []:
+            if not isinstance(route, dict):
+                continue
 
-        upstreams = route.get("upstreams")
-        backends = route.get("backends")
+            if route.get("type") == "static":
+                continue
 
-        upstream_count = 1
+            route_path = str(
+                route.get("path")
+                or route.get("prefix")
+                or route.get("route")
+                or "/"
+            ).strip()
 
-        if isinstance(upstreams, list):
-            upstream_count = max(upstream_count, len(upstreams))
+            if len(route_path) > 1:
+                route_path = route_path.rstrip("/")
 
-        if isinstance(backends, list):
-            upstream_count = max(upstream_count, len(backends))
+            upstreams = route.get("upstreams")
+            backends = route.get("backends")
 
-        if upstream_count > 1:
-            route["balancing"] = prompt_balancing
+            upstream_count = 1
+
+            if isinstance(upstreams, list):
+                upstream_count = max(upstream_count, len(upstreams))
+
+            if isinstance(backends, list):
+                upstream_count = max(upstream_count, len(backends))
+
+            if route_path == path and upstream_count > 1:
+                route["balancing"] = algorithm
+                route.pop("load_balance", None)
 
     return fixed
 
@@ -386,8 +430,10 @@ def lock_prompt_route_intent(
     config: dict[str, Any],
     prompt: str | None,
 ) -> dict[str, Any]:
-    fixed = apply_prompt_route_hints(config, prompt)
+    fixed = normalize_load_balance_aliases(config)
+    fixed = apply_prompt_route_hints(fixed, prompt)
     fixed = apply_prompt_balancing_hint(fixed, prompt)
+    fixed = normalize_load_balance_aliases(fixed)
     return fixed
 
 

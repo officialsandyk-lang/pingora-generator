@@ -119,18 +119,22 @@ def normalize_static_route(route: dict[str, Any], path: str) -> dict[str, Any]:
     )
     normalized["index"] = str(route.get("index") or "index.html")
 
-    normalized.pop("upstream", None)
-    normalized.pop("backend", None)
-    normalized.pop("upstreams", None)
-    normalized.pop("backends", None)
-    normalized.pop("backend_upstreams", None)
-    normalized.pop("balancing", None)
-    normalized.pop("algorithm", None)
-    normalized.pop("lb_algorithm", None)
-    normalized.pop("load_balancing", None)
-    normalized.pop("strategy", None)
-    normalized.pop("target", None)
-    normalized.pop("url", None)
+    for key in (
+        "upstream",
+        "backend",
+        "upstreams",
+        "backends",
+        "backend_upstreams",
+        "balancing",
+        "load_balance",
+        "algorithm",
+        "lb_algorithm",
+        "load_balancing",
+        "strategy",
+        "target",
+        "url",
+    ):
+        normalized.pop(key, None)
 
     return normalized
 
@@ -214,30 +218,25 @@ def extract_route_upstreams(route: dict[str, Any]) -> list[dict[str, Any]]:
 
     for item in raw_items:
         if isinstance(item, str) and "," in item:
-            for part in split_upstream_values(item):
-                upstream = normalize_upstream_item(part)
-                address = upstream["address"]
-
-                if address not in seen:
-                    upstreams.append(upstream)
-                    seen.add(address)
-
-            continue
-
-        upstream = normalize_upstream_item(item)
-        address = upstream["address"]
-
-        if address not in seen:
-            upstreams.append(upstream)
-            seen.add(address)
+            parts = split_upstream_values(item)
         else:
-            for existing in upstreams:
-                if existing["address"] == address:
-                    existing["weight"] = max(
-                        int(existing.get("weight", 1)),
-                        int(upstream.get("weight", 1)),
-                    )
-                    break
+            parts = [item]
+
+        for part in parts:
+            upstream = normalize_upstream_item(part)
+            address = upstream["address"]
+
+            if address not in seen:
+                upstreams.append(upstream)
+                seen.add(address)
+            else:
+                for existing in upstreams:
+                    if existing["address"] == address:
+                        existing["weight"] = max(
+                            int(existing.get("weight", 1)),
+                            int(upstream.get("weight", 1)),
+                        )
+                        break
 
     if not upstreams:
         upstreams.append(
@@ -343,7 +342,8 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
     first_address = addresses[0]
 
     requested_balancing = (
-        route.get("balancing")
+        route.get("load_balance")
+        or route.get("balancing")
         or route.get("algorithm")
         or route.get("lb_algorithm")
         or route.get("load_balancing")
@@ -372,14 +372,18 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
         normalized.pop("upstreams", None)
         normalized.pop("balancing", None)
 
-    normalized.pop("algorithm", None)
-    normalized.pop("lb_algorithm", None)
-    normalized.pop("load_balancing", None)
-    normalized.pop("strategy", None)
-    normalized.pop("backends", None)
-    normalized.pop("backend_upstreams", None)
-    normalized.pop("target", None)
-    normalized.pop("url", None)
+    for key in (
+        "load_balance",
+        "algorithm",
+        "lb_algorithm",
+        "load_balancing",
+        "strategy",
+        "backends",
+        "backend_upstreams",
+        "target",
+        "url",
+    ):
+        normalized.pop(key, None)
 
     return normalized
 
@@ -455,7 +459,8 @@ def merge_duplicate_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]
         route["backend"] = addresses[0]
 
         balancing = normalize_balancing(
-            route.get("balancing")
+            route.get("load_balance")
+            or route.get("balancing")
             or route.get("algorithm")
             or route.get("lb_algorithm")
             or route.get("load_balancing"),
@@ -475,14 +480,18 @@ def merge_duplicate_routes(routes: list[dict[str, Any]]) -> list[dict[str, Any]]
             route.pop("upstreams", None)
             route.pop("balancing", None)
 
-        route.pop("algorithm", None)
-        route.pop("lb_algorithm", None)
-        route.pop("load_balancing", None)
-        route.pop("strategy", None)
-        route.pop("backends", None)
-        route.pop("backend_upstreams", None)
-        route.pop("target", None)
-        route.pop("url", None)
+        for key in (
+            "load_balance",
+            "algorithm",
+            "lb_algorithm",
+            "load_balancing",
+            "strategy",
+            "backends",
+            "backend_upstreams",
+            "target",
+            "url",
+        ):
+            route.pop(key, None)
 
         output.append(route)
 

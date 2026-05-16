@@ -108,22 +108,18 @@ def normalize_balancing(value: Any) -> str:
         "rr": "round_robin",
         "roundrobin": "round_robin",
         "round_robin": "round_robin",
-
         "random": "random",
         "rand": "random",
-
         "weighted": "weighted_round_robin",
         "weighted_rr": "weighted_round_robin",
         "weighted_roundrobin": "weighted_round_robin",
         "weighted_round_robin": "weighted_round_robin",
         "wrr": "weighted_round_robin",
-
         "least_connection": "least_connections",
         "least_connections": "least_connections",
         "least_conn": "least_connections",
         "leastconn": "least_connections",
         "lc": "least_connections",
-
         "ip_hash": "ip_hash",
         "iphash": "ip_hash",
         "source_ip_hash": "ip_hash",
@@ -178,16 +174,21 @@ def normalize_static_route(route: dict[str, Any]) -> dict[str, Any]:
     fixed["balancing"] = "round_robin"
     fixed["upstreams"] = []
 
-    fixed.pop("upstream", None)
-    fixed.pop("backend", None)
-    fixed.pop("backends", None)
-    fixed.pop("backend_upstreams", None)
-    fixed.pop("algorithm", None)
-    fixed.pop("lb_algorithm", None)
-    fixed.pop("load_balancing", None)
-    fixed.pop("strategy", None)
-    fixed.pop("target", None)
-    fixed.pop("url", None)
+    for key in (
+        "upstream",
+        "backend",
+        "backends",
+        "backend_upstreams",
+        "load_balance",
+        "algorithm",
+        "lb_algorithm",
+        "load_balancing",
+        "strategy",
+        "target",
+        "url",
+        "address",
+    ):
+        fixed.pop(key, None)
 
     return fixed
 
@@ -240,7 +241,8 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
     )
 
     balancing = normalize_balancing(
-        route.get("balancing")
+        route.get("load_balance")
+        or route.get("balancing")
         or route.get("load_balancing")
         or route.get("lb_algorithm")
         or route.get("algorithm")
@@ -297,15 +299,19 @@ def normalize_route(route: dict[str, Any]) -> dict[str, Any]:
     fixed["upstream"] = upstreams[0]["address"]
     fixed["backend"] = upstreams[0]["address"]
 
-    fixed.pop("algorithm", None)
-    fixed.pop("lb_algorithm", None)
-    fixed.pop("load_balancing", None)
-    fixed.pop("strategy", None)
-    fixed.pop("backends", None)
-    fixed.pop("backend_upstreams", None)
-    fixed.pop("address", None)
-    fixed.pop("target", None)
-    fixed.pop("url", None)
+    for key in (
+        "load_balance",
+        "algorithm",
+        "lb_algorithm",
+        "load_balancing",
+        "strategy",
+        "backends",
+        "backend_upstreams",
+        "address",
+        "target",
+        "url",
+    ):
+        fixed.pop(key, None)
 
     return fixed
 
@@ -416,7 +422,7 @@ def merge_routes_for_generation(routes: list[dict[str, Any]]) -> list[dict[str, 
                 }
             ]
 
-        balancing = normalize_balancing(route.get("balancing"))
+        balancing = normalize_balancing(route.get("load_balance") or route.get("balancing"))
 
         if len(upstreams) > 1 and any(int(item.get("weight", 1)) != 1 for item in upstreams):
             balancing = "weighted_round_robin"
@@ -426,6 +432,20 @@ def merge_routes_for_generation(routes: list[dict[str, Any]]) -> list[dict[str, 
         route["upstream"] = upstreams[0]["address"]
         route["backend"] = upstreams[0]["address"]
         route["balancing"] = balancing
+
+        for key in (
+            "load_balance",
+            "algorithm",
+            "lb_algorithm",
+            "load_balancing",
+            "strategy",
+            "backends",
+            "backend_upstreams",
+            "target",
+            "url",
+            "address",
+        ):
+            route.pop(key, None)
 
         output.append(route)
 
